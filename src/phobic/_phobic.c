@@ -458,3 +458,71 @@ phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
     }
     return NULL;
 }
+
+/* ── serialization ──────────────────────────────────────────────────── */
+
+#define PHOBIC_MAGIC   ((uint32_t)0x50484F42) /* "PHOB" */
+#define PHOBIC_VERSION ((uint32_t)1)
+
+#define PHOBIC_HEADER_SIZE (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 5)
+
+static inline void write_u32(uint8_t *p, uint32_t v) { memcpy(p, &v, sizeof v); }
+static inline void write_u64(uint8_t *p, uint64_t v) { memcpy(p, &v, sizeof v); }
+static inline uint32_t read_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, sizeof v); return v; }
+static inline uint64_t read_u64(const uint8_t *p) { uint64_t v; memcpy(&v, p, sizeof v); return v; }
+
+size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
+    if (!phf) return 0;
+
+    size_t pilots_bytes = phf->num_buckets * sizeof(uint16_t);
+    size_t total = PHOBIC_HEADER_SIZE + pilots_bytes;
+
+    /* size query: caller passed NULL buf */
+    if (!buf) return total;
+    if (buf_len < total) return 0;
+
+    uint8_t *p = buf;
+    write_u32(p, PHOBIC_MAGIC);    p += sizeof(uint32_t);
+    write_u32(p, PHOBIC_VERSION);  p += sizeof(uint32_t);
+    write_u64(p, (uint64_t)phf->num_keys);    p += sizeof(uint64_t);
+    write_u64(p, (uint64_t)phf->range_size);  p += sizeof(uint64_t);
+    write_u64(p, (uint64_t)phf->num_buckets); p += sizeof(uint64_t);
+    write_u64(p, (uint64_t)phf->bucket_size); p += sizeof(uint64_t);
+    write_u64(p, phf->seed);                  p += sizeof(uint64_t);
+    memcpy(p, phf->pilots, pilots_bytes);
+
+    return total;
+}
+
+phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
+    if (!buf || buf_len < PHOBIC_HEADER_SIZE) return NULL;
+
+    const uint8_t *p = buf;
+    uint32_t magic   = read_u32(p); p += sizeof(uint32_t);
+    uint32_t version = read_u32(p); p += sizeof(uint32_t);
+
+    if (magic != PHOBIC_MAGIC || version != PHOBIC_VERSION) return NULL;
+
+    uint64_t num_keys    = read_u64(p); p += sizeof(uint64_t);
+    uint64_t range_size  = read_u64(p); p += sizeof(uint64_t);
+    uint64_t num_buckets = read_u64(p); p += sizeof(uint64_t);
+    uint64_t bucket_size = read_u64(p); p += sizeof(uint64_t);
+    uint64_t seed        = read_u64(p); p += sizeof(uint64_t);
+
+    size_t pilots_bytes = (size_t)num_buckets * sizeof(uint16_t);
+    if (buf_len < PHOBIC_HEADER_SIZE + pilots_bytes) return NULL;
+
+    uint16_t *pilots = malloc(pilots_bytes);
+    if (!pilots) return NULL;
+    memcpy(pilots, p, pilots_bytes);
+
+    phobic_phf *phf = malloc(sizeof(phobic_phf));
+    if (!phf) { free(pilots); return NULL; }
+    phf->pilots      = pilots;
+    phf->num_keys    = (size_t)num_keys;
+    phf->range_size  = (size_t)range_size;
+    phf->num_buckets = (size_t)num_buckets;
+    phf->bucket_size = (size_t)bucket_size;
+    phf->seed        = seed;
+    return phf;
+}
