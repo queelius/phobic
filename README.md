@@ -46,9 +46,13 @@ phf = phobic.build(keys, threads=0)
 phf = phobic.build(keys, seed=42)
 ```
 
+## Space Efficiency
+
+PHOBIC achieves ~2.7 bits/key for the hash structure. When used as a filter (PHF + n-bit fingerprints), total space is `2.7 + log2(1/e)` bits/key for false positive rate `e`. This beats Bloom filters (`1.44 * log2(1/e)` bits/key) whenever `e < 1.4%`.
+
 ## Performance
 
-Implemented in C11 with parallel construction via pthreads. Typically ~2-3 bits per key.
+Implemented in C11 with parallel construction via pthreads.
 
 ## License
 
