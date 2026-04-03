@@ -1,5 +1,7 @@
 """phobic: Fast minimal perfect hash functions."""
 
+__all__ = ['PHF', 'build', 'from_bytes']
+
 from phobic._module import (
     build as _build,
     query as _query,
@@ -8,6 +10,7 @@ from phobic._module import (
     num_keys as _num_keys,
     range_size as _range_size,
     bits_per_key as _bits_per_key,
+    collisions as _collisions,
 )
 
 
@@ -43,6 +46,16 @@ class PHF:
         """Space efficiency of the hash structure."""
         return _bits_per_key(self._handle)
 
+    @property
+    def collisions(self):
+        """Number of collisions (0 for a perfect hash function)."""
+        return _collisions(self._handle)
+
+    @property
+    def is_perfect(self):
+        """True if this is a perfect hash function (zero collisions)."""
+        return self.collisions == 0
+
     def to_bytes(self):
         """Serialize to bytes."""
         return _serialize(self._handle)
@@ -56,28 +69,41 @@ class PHF:
         return self.num_keys
 
     def __repr__(self):
+        c = self.collisions
+        collision_str = f", collisions={c}" if c else ""
         return (f"PHF(num_keys={self.num_keys}, "
                 f"range_size={self.range_size}, "
-                f"bits_per_key={self.bits_per_key:.2f})")
+                f"bits_per_key={self.bits_per_key:.2f}"
+                f"{collision_str})")
 
 
-def build(keys, *, alpha=1.0, seed=None, threads=0):
+def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True):
     """Build a perfect hash function from a list of keys.
 
     Args:
         keys: List of str or bytes keys.
-        alpha: Load factor (>= 1.0). Higher = faster build, more memory.
+        alpha: Overhead fraction. range_size = ceil(n * (1 + alpha)). Default
+               1.0 gives range_size = 2n (fast build). Use smaller values
+               (e.g. 0.05) for closer-to-minimal output at the cost of slower
+               construction.
         seed: Random seed for reproducibility. None = random.
-        threads: Number of build threads (0 = auto-detect, 1 = single).
+        max_retries: Number of seed/alpha attempts before giving up. Default 100.
+        strict: If True (default), raise RuntimeError if a perfect build cannot
+                be found within max_retries. If False, fall back to a non-perfect
+                hash; PHF.collisions will be > 0. The best result across all
+                attempts (fewest collisions) is returned.
 
     Returns:
-        PHF object.
+        PHF object. Check PHF.is_perfect / PHF.collisions when strict=False.
     """
     if seed is None:
         import random
         seed = random.getrandbits(64)
+    seed = int(seed)
+    if not (0 <= seed < 2**64):
+        raise ValueError(f"seed must be in [0, 2**64), got {seed}")
     raw_keys = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
-    handle = _build(raw_keys, float(alpha), int(seed), int(threads))
+    handle = _build(raw_keys, float(alpha), seed, int(max_retries), int(strict))
     return PHF(handle)
 
 

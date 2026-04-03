@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Python package providing PHOBIC (pilot-based) perfect hash functions. Core implementation in C11 for speed. No dependencies. Parallel construction via pthreads.
+A Python package providing PHOBIC (pilot-based) perfect hash functions. Core implementation in C11 for speed. No runtime dependencies.
 
 A perfect hash function maps a known set of n keys to distinct integers in [0, m) with no collisions. `phobic.build(keys)` constructs one; `phf[key]` queries it.
 
@@ -10,10 +10,9 @@ A perfect hash function maps a known set of n keys to distinct integers in [0, m
 
 1. Clean, fast C11 implementation of the PHOBIC algorithm
 2. Python API via C extension module (setuptools)
-3. Parallel construction (pthreads + atomics)
-4. Configurable load factor (alpha parameter: range_size = ceil(n * alpha))
-5. Serialization (to/from bytes)
-6. Publish to PyPI as `phobic`
+3. Configurable load factor (alpha parameter: range_size = ceil(n * alpha))
+4. Serialization (to/from bytes)
+5. Publish to PyPI as `phobic`
 
 ## Non-Goals
 
@@ -29,8 +28,6 @@ import phobic
 # Build
 phf = phobic.build(["key1", "key2", "key3"])
 phf = phobic.build(keys, alpha=1.05)        # 5% extra slots
-phf = phobic.build(keys, threads=4)          # parallel build
-phf = phobic.build(keys, threads=0)          # auto-detect cores
 phf = phobic.build(keys, seed=42)            # reproducible
 
 # Query
@@ -79,9 +76,9 @@ typedef struct {
     uint64_t  seed;
 } phobic_phf;
 
-// Build (single-threaded or multi-threaded)
-phobic_phf *phobic_build(const char **keys, size_t *key_lens, size_t num_keys,
-                          double alpha, uint64_t seed, int threads);
+// Build
+phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
+                          size_t num_keys, double alpha, uint64_t seed);
 
 // Query
 size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len);
@@ -108,24 +105,14 @@ static uint64_t phobic_hash(const char *key, size_t len, uint64_t seed);
 
 Single hash function, derive h1 (bucket) and h2 (slot) by mixing with different constants. Same approach as the maph C++ version but in C.
 
-### Parallel Build
+### Build Algorithm
 
-Phase 1 (serial): hash keys, assign to buckets, sort buckets by size descending.
+1. Hash all keys (dual wyhash-style hash: h1 for bucket, h2 for slot derivation)
+2. Assign keys to buckets via h1, sort buckets by descending size
+3. For each bucket (largest first), brute-force search for a pilot value (0..65535) such that `slot_with_pilot(h2, pilot, range_size)` produces no collisions against the global occupied bitset
+4. Mark occupied slots, store winning pilot
 
-Phase 2 (parallel): pilot search. Each thread:
-1. Atomically claims the next bucket from a shared counter
-2. For pilot = 0, 1, 2, ...:
-   - Compute candidate slots for each key in bucket
-   - Check internal collisions (within bucket)
-   - Atomically test-and-set bits in shared occupied bitset
-   - If any bit already set, undo claimed bits, try next pilot
-3. Store winning pilot
-
-The shared occupied bitset uses `_Atomic uint64_t` words with `atomic_fetch_or` for claiming and `atomic_fetch_and` for undoing.
-
-Phase 3 (serial): collect results, free temporaries.
-
-Thread pool: spawn `threads` pthreads, each runs the bucket-processing loop until all buckets are done.
+The GIL is released during `phobic_build` so other Python threads can run concurrently.
 
 ### Retry Logic
 
@@ -134,7 +121,7 @@ If pilot search exhausts 65535 pilots for any bucket, the build retries with a d
 ### Python Extension (`_module.c`)
 
 Thin glue between Python and the C core:
-- `_module.build(keys, alpha, seed, threads)` -> PyCapsule wrapping `phobic_phf*`
+- `_module.build(keys, alpha, seed)` -> PyCapsule wrapping `phobic_phf*`
 - `_module.query(capsule, key)` -> PyLong
 - `_module.serialize(capsule)` -> PyBytes
 - `_module.deserialize(data)` -> PyCapsule
@@ -193,12 +180,12 @@ class PHF:
     def __repr__(self):
         return f"PHF(num_keys={self.num_keys}, range_size={self.range_size}, bits_per_key={self.bits_per_key:.2f})"
 
-def build(keys, *, alpha=1.0, seed=None, threads=0):
+def build(keys, *, alpha=1.0, seed=None):
     if seed is None:
         import random
         seed = random.getrandbits(64)
     raw_keys = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
-    handle = _build(raw_keys, float(alpha), int(seed), int(threads))
+    handle = _build(raw_keys, float(alpha), int(seed))
     return PHF(handle)
 
 def from_bytes(data):
@@ -250,8 +237,8 @@ setup(
         Extension(
             "phobic._module",
             sources=["src/phobic/_module.c", "src/phobic/_phobic.c"],
-            extra_compile_args=["-O3", "-march=native", "-std=c11", "-pthread"],
-            extra_link_args=["-pthread"],
+            extra_compile_args=["-O2", "-std=c11", "-Wall", "-Wextra"],
+            extra_link_args=[],
         ),
     ],
 )
@@ -289,12 +276,6 @@ def test_serialization():
     phf2 = phobic.from_bytes(data)
     assert all(phf[k] == phf2[k] for k in keys)
 
-def test_threads():
-    keys = [f"key_{i}" for i in range(10000)]
-    phf = phobic.build(keys, threads=4)
-    slots = {phf[k] for k in keys}
-    assert len(slots) == len(keys)
-
 def test_bytes_keys():
     keys = [b"raw_bytes_0", b"raw_bytes_1", b"raw_bytes_2"]
     phf = phobic.build(keys)
@@ -321,6 +302,5 @@ def test_bits_per_key():
 - All tests pass with `pytest`
 - Bijectivity verified at 10K, 100K, 1M keys
 - bits_per_key < 3.5 at 10K+ keys
-- Parallel build with 4 threads is at least 2x faster than single-threaded at 100K+ keys
 - Serialization round-trip preserves all slot assignments
 - No memory leaks (valgrind clean)

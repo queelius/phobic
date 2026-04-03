@@ -1,10 +1,22 @@
 #include "_phobic.h"
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
-#include <stdatomic.h>
-#include <pthread.h>
-#include <unistd.h>
+
+/* ── little-endian load helpers ──────────────────────────────────────── */
+
+/* Explicit LE reads ensure identical hash output on all architectures. */
+static inline uint64_t load_u64_le(const uint8_t *p) {
+    return (uint64_t)p[0]         | ((uint64_t)p[1] << 8)
+         | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24)
+         | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
+         | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+static inline uint64_t load_u64_le_partial(const uint8_t *p, size_t n) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
 
 /* ── wyhash-style mixing ─────────────────────────────────────────────── */
 
@@ -17,13 +29,10 @@ static uint64_t phobic_hash(const char *key, size_t len, uint64_t seed) {
     uint64_t h = seed;
     const uint8_t *p = (const uint8_t *)key;
     while (len >= 8) {
-        uint64_t v;
-        memcpy(&v, p, 8);
-        h = wymix(h ^ v, 0x9e3779b97f4a7c15ULL);
+        h = wymix(h ^ load_u64_le(p), 0x9e3779b97f4a7c15ULL);
         p += 8; len -= 8;
     }
-    uint64_t tail = 0;
-    if (len > 0) { memcpy(&tail, p, len); h = wymix(h ^ tail, 0x517cc1b727220a95ULL); }
+    if (len > 0) h = wymix(h ^ load_u64_le_partial(p, len), 0x517cc1b727220a95ULL);
     return wymix(h, 0x94d049bb133111ebULL);
 }
 
@@ -76,329 +85,164 @@ static inline void bitset_set(uint64_t *bs, size_t idx) {
     bs[idx / 64] |= (uint64_t)1 << (idx % 64);
 }
 
-/* ── single-threaded build ───────────────────────────────────────────── */
+/* ── bucket layout ───────────────────────────────────────────────────── */
 
-static phobic_phf *try_build_single(const dual_hash *hashes, size_t num_keys,
-                                     size_t range_size, size_t num_buckets,
-                                     size_t bucket_size, uint64_t seed) {
-    /*
-     * 1. Compute bucket membership via prefix-sum.
-     * 2. Sort buckets by descending size.
-     * 3. For each bucket (largest first), brute-force pilot search
-     *    against a global occupied bitset.
-     */
+typedef struct { size_t count; size_t index; } bucket_entry;
 
-    /* ── bucket counts ──────────────────────────────────────────────── */
-    size_t *counts = calloc(num_buckets, sizeof(size_t));
-    if (!counts) return NULL;
+static int bucket_entry_cmp_desc(const void *a, const void *b) {
+    size_t ca = ((const bucket_entry *)a)->count;
+    size_t cb = ((const bucket_entry *)b)->count;
+    return (ca < cb) - (ca > cb);
+}
+
+typedef struct {
+    size_t *counts;
+    size_t *prefix;
+    size_t *members;
+    size_t *order;
+    size_t  num_buckets;
+    size_t  max_bucket;
+} bucket_layout;
+
+static void bucket_layout_free(bucket_layout *bl) {
+    free(bl->counts);
+    free(bl->prefix);
+    free(bl->members);
+    free(bl->order);
+}
+
+static int bucket_layout_init(bucket_layout *bl, const dual_hash *hashes,
+                              size_t num_keys, size_t num_buckets) {
+    bl->num_buckets = num_buckets;
+    bl->counts  = NULL;
+    bl->prefix  = NULL;
+    bl->members = NULL;
+    bl->order   = NULL;
+
+    bl->counts = calloc(num_buckets, sizeof(size_t));
+    if (!bl->counts) goto fail;
 
     for (size_t i = 0; i < num_keys; i++)
-        counts[bucket_for(hashes[i].h1, num_buckets)]++;
+        bl->counts[bucket_for(hashes[i].h1, num_buckets)]++;
 
-    /* ── prefix-sum for O(1) bucket member access ───────────────────── */
-    size_t *prefix = malloc((num_buckets + 1) * sizeof(size_t));
-    if (!prefix) { free(counts); return NULL; }
-    prefix[0] = 0;
+    bl->prefix = malloc((num_buckets + 1) * sizeof(size_t));
+    if (!bl->prefix) goto fail;
+    bl->prefix[0] = 0;
     for (size_t b = 0; b < num_buckets; b++)
-        prefix[b + 1] = prefix[b] + counts[b];
+        bl->prefix[b + 1] = bl->prefix[b] + bl->counts[b];
 
-    /* ── scatter keys into bucket-ordered array ─────────────────────── */
-    size_t *bucket_members = malloc(num_keys * sizeof(size_t));
+    bl->members = malloc(num_keys * sizeof(size_t));
     size_t *write_pos = malloc(num_buckets * sizeof(size_t));
-    if (!bucket_members || !write_pos) {
-        free(counts); free(prefix); free(bucket_members); free(write_pos);
-        return NULL;
-    }
-    memcpy(write_pos, prefix, num_buckets * sizeof(size_t));
+    if (!bl->members || !write_pos) { free(write_pos); goto fail; }
+    memcpy(write_pos, bl->prefix, num_buckets * sizeof(size_t));
     for (size_t i = 0; i < num_keys; i++) {
         size_t b = bucket_for(hashes[i].h1, num_buckets);
-        bucket_members[write_pos[b]++] = i;
+        bl->members[write_pos[b]++] = i;
     }
     free(write_pos);
 
-    /* ── sort bucket indices by descending size ─────────────────────── */
-    size_t *order = malloc(num_buckets * sizeof(size_t));
-    if (!order) {
-        free(counts); free(prefix); free(bucket_members); free(order);
+    /* Sort bucket indices by descending size using a packed {count, index}
+     * array so qsort's comparator needs no external state. */
+    bucket_entry *entries = malloc(num_buckets * sizeof(bucket_entry));
+    bl->order = malloc(num_buckets * sizeof(size_t));
+    if (!entries || !bl->order) { free(entries); goto fail; }
+    for (size_t b = 0; b < num_buckets; b++)
+        entries[b] = (bucket_entry){ bl->counts[b], b };
+    qsort(entries, num_buckets, sizeof(bucket_entry), bucket_entry_cmp_desc);
+    for (size_t b = 0; b < num_buckets; b++) bl->order[b] = entries[b].index;
+    free(entries);
+
+    bl->max_bucket = bl->counts[bl->order[0]];
+    return 0;
+
+fail:
+    bucket_layout_free(bl);
+    return -1;
+}
+
+/* ── assemble a phobic_phf from completed pilots ─────────────────────── */
+
+static phobic_phf *assemble_phf(uint16_t *pilots, size_t num_keys,
+                                size_t range_size, size_t num_buckets,
+                                size_t bucket_size, uint64_t seed,
+                                size_t collisions) {
+    phobic_phf *phf = malloc(sizeof(phobic_phf));
+    if (!phf) { free(pilots); return NULL; }
+    phf->pilots      = pilots;
+    phf->num_keys    = num_keys;
+    phf->range_size  = range_size;
+    phf->num_buckets = num_buckets;
+    phf->bucket_size = bucket_size;
+    phf->seed        = seed;
+    phf->collisions  = collisions;
+    return phf;
+}
+
+/* ── build ───────────────────────────────────────────────────────────── */
+
+/* strict=1: return NULL on first unsolvable bucket.
+ * strict=0: fall back to pilot 0 for unsolvable buckets; count collisions. */
+static phobic_phf *try_build(const dual_hash *hashes, size_t num_keys,
+                              size_t range_size, size_t num_buckets,
+                              size_t bucket_size, uint64_t seed, int strict) {
+    bucket_layout bl;
+    if (bucket_layout_init(&bl, hashes, num_keys, num_buckets) < 0)
         return NULL;
-    }
-    for (size_t b = 0; b < num_buckets; b++) order[b] = b;
 
-    /* simple insertion sort -- num_buckets is moderate */
-    for (size_t i = 1; i < num_buckets; i++) {
-        size_t key = order[i];
-        size_t key_cnt = counts[key];
-        size_t j = i;
-        while (j > 0 && counts[order[j - 1]] < key_cnt) {
-            order[j] = order[j - 1];
-            j--;
-        }
-        order[j] = key;
-    }
-
-    /* ── allocate pilots + occupied bitset ──────────────────────────── */
     uint16_t *pilots = calloc(num_buckets, sizeof(uint16_t));
     size_t bsw = bitset_words(range_size);
     uint64_t *occupied = calloc(bsw, sizeof(uint64_t));
-    if (!pilots || !occupied) {
-        free(counts); free(prefix); free(bucket_members); free(order);
-        free(pilots); free(occupied);
-        return NULL;
-    }
-
-    /* ── temp array for candidate slots within a bucket ─────────────── */
-    size_t max_bucket = counts[order[0]];
-    size_t *candidates = malloc(max_bucket * sizeof(size_t));
-    if (!candidates) {
-        free(counts); free(prefix); free(bucket_members); free(order);
+    size_t *candidates = malloc(bl.max_bucket * sizeof(size_t));
+    if (!pilots || !occupied || !candidates) {
         free(pilots); free(occupied); free(candidates);
+        bucket_layout_free(&bl);
         return NULL;
     }
 
-    /* ── pilot search ───────────────────────────────────────────────── */
+    size_t collisions = 0;
     int failed = 0;
-    for (size_t oi = 0; oi < num_buckets && !failed; oi++) {
-        size_t b = order[oi];
-        size_t bsize = counts[b];
+    for (size_t oi = 0; oi < num_buckets; oi++) {
+        size_t b = bl.order[oi];
+        size_t bsize = bl.counts[b];
         if (bsize == 0) { pilots[b] = 0; continue; }
 
-        size_t bstart = prefix[b];
+        size_t bstart = bl.prefix[b];
         int found = 0;
 
-        for (uint32_t pilot = 0; pilot < 65535 && !found; pilot++) {
-            /* compute candidate slots for this pilot */
+        for (uint32_t pilot = 0; pilot < 65536 && !found; pilot++) {
             int collision = 0;
             for (size_t k = 0; k < bsize && !collision; k++) {
-                size_t ki = bucket_members[bstart + k];
+                size_t ki = bl.members[bstart + k];
                 size_t slot = slot_with_pilot(hashes[ki].h2, (uint16_t)pilot, range_size);
-                /* check global occupied */
                 if (bitset_test(occupied, slot)) { collision = 1; break; }
-                /* check internal collisions within this bucket */
                 for (size_t prev = 0; prev < k; prev++) {
                     if (candidates[prev] == slot) { collision = 1; break; }
                 }
                 candidates[k] = slot;
             }
             if (!collision) {
-                /* commit: mark slots occupied, store pilot */
                 for (size_t k = 0; k < bsize; k++)
                     bitset_set(occupied, candidates[k]);
                 pilots[b] = (uint16_t)pilot;
                 found = 1;
             }
         }
-        if (!found) failed = 1;
+        if (!found) {
+            if (strict) { failed = 1; break; }
+            /* Non-strict: use pilot 0, count each key in this bucket
+             * as a collision (they may land on already-occupied slots). */
+            pilots[b] = 0;
+            collisions += bsize;
+        }
     }
 
-    free(counts); free(prefix); free(bucket_members);
-    free(order); free(occupied); free(candidates);
+    free(occupied);
+    free(candidates);
+    bucket_layout_free(&bl);
 
     if (failed) { free(pilots); return NULL; }
-
-    /* ── assemble result ────────────────────────────────────────────── */
-    phobic_phf *phf = malloc(sizeof(phobic_phf));
-    if (!phf) { free(pilots); return NULL; }
-    phf->pilots      = pilots;
-    phf->num_keys    = num_keys;
-    phf->range_size  = range_size;
-    phf->num_buckets = num_buckets;
-    phf->bucket_size = bucket_size;
-    phf->seed        = seed;
-    return phf;
-}
-
-/* ── parallel build ─────────────────────────────────────────────────── */
-
-typedef struct {
-    const dual_hash *hashes;
-    const size_t    *bucket_starts;  /* prefix[b]            */
-    const size_t    *bucket_counts;  /* counts[b]            */
-    const size_t    *key_indices;    /* bucket_members array  */
-    const size_t    *order;          /* bucket indices sorted by desc size */
-    size_t           num_buckets;
-    size_t           range_size;
-    uint16_t        *pilots;         /* output                */
-    _Atomic uint64_t *occupied;      /* shared atomic bitset  */
-    _Atomic size_t    next_bucket;   /* work counter          */
-    _Atomic int       failed;        /* error flag            */
-} parallel_ctx;
-
-static void *worker_thread(void *arg) {
-    parallel_ctx *ctx = (parallel_ctx *)arg;
-
-    /* per-thread scratch for candidate slots */
-    size_t max_bsize = 0;
-    for (size_t i = 0; i < ctx->num_buckets; i++) {
-        size_t c = ctx->bucket_counts[ctx->order[i]];
-        if (c > max_bsize) max_bsize = c;
-    }
-    size_t *candidates = malloc(max_bsize * sizeof(size_t));
-    if (!candidates) { atomic_store(&ctx->failed, 1); return NULL; }
-
-    for (;;) {
-        size_t oi = atomic_fetch_add(&ctx->next_bucket, 1);
-        if (oi >= ctx->num_buckets) break;
-        if (atomic_load(&ctx->failed)) break;
-
-        size_t b     = ctx->order[oi];
-        size_t bsize = ctx->bucket_counts[b];
-        if (bsize == 0) { ctx->pilots[b] = 0; continue; }
-
-        size_t bstart = ctx->bucket_starts[b];
-        int found = 0;
-
-        for (uint32_t pilot = 0; pilot < 65535 && !found; pilot++) {
-            /* compute candidate slots for this pilot */
-            int collision = 0;
-            for (size_t k = 0; k < bsize && !collision; k++) {
-                size_t ki   = ctx->key_indices[bstart + k];
-                size_t slot = slot_with_pilot(ctx->hashes[ki].h2,
-                                              (uint16_t)pilot,
-                                              ctx->range_size);
-                /* check internal collisions within this bucket */
-                for (size_t prev = 0; prev < k; prev++) {
-                    if (candidates[prev] == slot) { collision = 1; break; }
-                }
-                if (collision) break;
-                candidates[k] = slot;
-            }
-            if (collision) continue;
-
-            /* atomically claim all slots */
-            int claim_ok = 1;
-            size_t claimed = 0;
-            for (size_t k = 0; k < bsize && claim_ok; k++) {
-                size_t word = candidates[k] / 64;
-                uint64_t bit = (uint64_t)1 << (candidates[k] % 64);
-                uint64_t prev_val = atomic_fetch_or(&ctx->occupied[word], bit);
-                if (prev_val & bit) {
-                    /* slot was already taken -- undo all claims so far */
-                    claim_ok = 0;
-                    for (size_t u = 0; u < claimed; u++) {
-                        size_t uw = candidates[u] / 64;
-                        uint64_t ub = (uint64_t)1 << (candidates[u] % 64);
-                        atomic_fetch_and(&ctx->occupied[uw], ~ub);
-                    }
-                } else {
-                    claimed++;
-                }
-            }
-            if (claim_ok) {
-                ctx->pilots[b] = (uint16_t)pilot;
-                found = 1;
-            }
-        }
-        if (!found) atomic_store(&ctx->failed, 1);
-    }
-
-    free(candidates);
-    return NULL;
-}
-
-static phobic_phf *try_build_parallel(const dual_hash *hashes, size_t num_keys,
-                                       size_t range_size, size_t num_buckets,
-                                       size_t bucket_size, uint64_t seed,
-                                       int nthreads) {
-    /* ── bucket counts ─────────────────────────────────────────────── */
-    size_t *counts = calloc(num_buckets, sizeof(size_t));
-    if (!counts) return NULL;
-
-    for (size_t i = 0; i < num_keys; i++)
-        counts[bucket_for(hashes[i].h1, num_buckets)]++;
-
-    /* ── prefix-sum ────────────────────────────────────────────────── */
-    size_t *prefix = malloc((num_buckets + 1) * sizeof(size_t));
-    if (!prefix) { free(counts); return NULL; }
-    prefix[0] = 0;
-    for (size_t b = 0; b < num_buckets; b++)
-        prefix[b + 1] = prefix[b] + counts[b];
-
-    /* ── scatter keys ──────────────────────────────────────────────── */
-    size_t *bucket_members = malloc(num_keys * sizeof(size_t));
-    size_t *write_pos = malloc(num_buckets * sizeof(size_t));
-    if (!bucket_members || !write_pos) {
-        free(counts); free(prefix); free(bucket_members); free(write_pos);
-        return NULL;
-    }
-    memcpy(write_pos, prefix, num_buckets * sizeof(size_t));
-    for (size_t i = 0; i < num_keys; i++) {
-        size_t b = bucket_for(hashes[i].h1, num_buckets);
-        bucket_members[write_pos[b]++] = i;
-    }
-    free(write_pos);
-
-    /* ── sort bucket indices by descending size ────────────────────── */
-    size_t *order = malloc(num_buckets * sizeof(size_t));
-    if (!order) {
-        free(counts); free(prefix); free(bucket_members);
-        return NULL;
-    }
-    for (size_t b = 0; b < num_buckets; b++) order[b] = b;
-    for (size_t i = 1; i < num_buckets; i++) {
-        size_t key = order[i];
-        size_t key_cnt = counts[key];
-        size_t j = i;
-        while (j > 0 && counts[order[j - 1]] < key_cnt) {
-            order[j] = order[j - 1];
-            j--;
-        }
-        order[j] = key;
-    }
-
-    /* ── allocate pilots + atomic occupied bitset ──────────────────── */
-    uint16_t *pilots = calloc(num_buckets, sizeof(uint16_t));
-    size_t bsw = bitset_words(range_size);
-    _Atomic uint64_t *occupied = calloc(bsw, sizeof(_Atomic uint64_t));
-    if (!pilots || !occupied) {
-        free(counts); free(prefix); free(bucket_members); free(order);
-        free(pilots); free(occupied);
-        return NULL;
-    }
-
-    /* ── set up shared context ─────────────────────────────────────── */
-    parallel_ctx ctx = {
-        .hashes        = hashes,
-        .bucket_starts = prefix,
-        .bucket_counts = counts,
-        .key_indices   = bucket_members,
-        .order         = order,
-        .num_buckets   = num_buckets,
-        .range_size    = range_size,
-        .pilots        = pilots,
-        .occupied      = occupied,
-        .next_bucket   = 0,
-        .failed        = 0,
-    };
-
-    /* ── spawn worker threads ──────────────────────────────────────── */
-    pthread_t *threads = malloc((size_t)nthreads * sizeof(pthread_t));
-    if (!threads) {
-        free(counts); free(prefix); free(bucket_members); free(order);
-        free(pilots); free(occupied);
-        return NULL;
-    }
-
-    for (int t = 0; t < nthreads; t++)
-        pthread_create(&threads[t], NULL, worker_thread, &ctx);
-    for (int t = 0; t < nthreads; t++)
-        pthread_join(threads[t], NULL);
-
-    free(threads);
-    free(counts); free(prefix); free(bucket_members);
-    free(order); free(occupied);
-
-    if (atomic_load(&ctx.failed)) { free(pilots); return NULL; }
-
-    /* ── assemble result ───────────────────────────────────────────── */
-    phobic_phf *phf = malloc(sizeof(phobic_phf));
-    if (!phf) { free(pilots); return NULL; }
-    phf->pilots      = pilots;
-    phf->num_keys    = num_keys;
-    phf->range_size  = range_size;
-    phf->num_buckets = num_buckets;
-    phf->bucket_size = bucket_size;
-    phf->seed        = seed;
-    return phf;
+    return assemble_phf(pilots, num_keys, range_size, num_buckets, bucket_size, seed,
+                        collisions);
 }
 
 /* ── query ───────────────────────────────────────────────────────────── */
@@ -412,22 +256,17 @@ size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len) {
 /* ── public build ────────────────────────────────────────────────────── */
 
 phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
-                          size_t num_keys, double alpha,
-                          uint64_t seed, int threads) {
+                          size_t num_keys, double alpha, uint64_t seed,
+                          int max_retries, int strict) {
     if (num_keys == 0) return NULL;
+    if (max_retries <= 0) max_retries = 1;
 
-    /* auto-detect thread count */
-    int nthreads = threads;
-    if (nthreads <= 0) {
-        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-        nthreads = (ncpus > 1) ? (int)ncpus : 1;
-    }
-
-    static const int MAX_RETRIES = 100;
     static const int BUMP_INTERVAL = 10;
     static const double ALPHA_BUMP = 0.005;
 
-    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    phobic_phf *best = NULL; /* non-strict: track fewest collisions */
+
+    for (int attempt = 0; attempt < max_retries; attempt++) {
         uint64_t cur_seed = seed ^ (uint64_t)attempt;
         double cur_alpha = alpha + ALPHA_BUMP * (double)(attempt / BUMP_INTERVAL);
 
@@ -438,38 +277,58 @@ phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
         if (bucket_size < 1) bucket_size = 1;
         size_t num_buckets = (num_keys + bucket_size - 1) / bucket_size;
 
-        /* precompute hashes with current seed */
         dual_hash *hashes = malloc(num_keys * sizeof(dual_hash));
-        if (!hashes) return NULL;
+        if (!hashes) { phobic_free(best); return NULL; }
         for (size_t i = 0; i < num_keys; i++)
             hashes[i] = hash_key(keys[i], key_lens[i], cur_seed);
 
-        phobic_phf *phf;
-        if (nthreads > 1 && num_keys > 1000)
-            phf = try_build_parallel(hashes, num_keys, range_size,
-                                     num_buckets, bucket_size, cur_seed,
-                                     nthreads);
-        else
-            phf = try_build_single(hashes, num_keys, range_size,
-                                   num_buckets, bucket_size, cur_seed);
+        phobic_phf *phf = try_build(hashes, num_keys, range_size,
+                                    num_buckets, bucket_size, cur_seed, strict);
         free(hashes);
 
-        if (phf) return phf;
+        if (!phf) continue; /* strict mode: try failed, next attempt */
+
+        if (phf->collisions == 0) {
+            phobic_free(best);
+            return phf; /* perfect — done */
+        }
+
+        /* Non-strict: keep this if it is better than our current best. */
+        if (!best || phf->collisions < best->collisions) {
+            phobic_free(best);
+            best = phf;
+        } else {
+            phobic_free(phf);
+        }
     }
-    return NULL;
+    return best; /* NULL in strict mode if all attempts failed */
 }
 
 /* ── serialization ──────────────────────────────────────────────────── */
 
 #define PHOBIC_MAGIC   ((uint32_t)0x50484F42) /* "PHOB" */
-#define PHOBIC_VERSION ((uint32_t)1)
+#define PHOBIC_VERSION ((uint32_t)2)
 
-#define PHOBIC_HEADER_SIZE (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 5)
+/* v2 header: magic(4) + version(4) + num_keys(8) + range_size(8) +
+ *            num_buckets(8) + bucket_size(8) + seed(8) + collisions(8) = 56 */
+#define PHOBIC_HEADER_SIZE (sizeof(uint32_t) * 2 + sizeof(uint64_t) * 6)
 
-static inline void write_u32(uint8_t *p, uint32_t v) { memcpy(p, &v, sizeof v); }
-static inline void write_u64(uint8_t *p, uint64_t v) { memcpy(p, &v, sizeof v); }
-static inline uint32_t read_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, sizeof v); return v; }
-static inline uint64_t read_u64(const uint8_t *p) { uint64_t v; memcpy(&v, p, sizeof v); return v; }
+static inline void write_u32(uint8_t *p, uint32_t v) {
+    p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24;
+}
+static inline void write_u64(uint8_t *p, uint64_t v) {
+    write_u32(p, (uint32_t)v); write_u32(p+4, (uint32_t)(v>>32));
+}
+static inline uint32_t read_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static inline uint64_t read_u64(const uint8_t *p) {
+    return (uint64_t)read_u32(p) | ((uint64_t)read_u32(p+4)<<32);
+}
+static inline void write_u16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
+static inline uint16_t read_u16(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1]<<8));
+}
 
 size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     if (!phf) return 0;
@@ -477,7 +336,6 @@ size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     size_t pilots_bytes = phf->num_buckets * sizeof(uint16_t);
     size_t total = PHOBIC_HEADER_SIZE + pilots_bytes;
 
-    /* size query: caller passed NULL buf */
     if (!buf) return total;
     if (buf_len < total) return 0;
 
@@ -489,7 +347,9 @@ size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     write_u64(p, (uint64_t)phf->num_buckets); p += sizeof(uint64_t);
     write_u64(p, (uint64_t)phf->bucket_size); p += sizeof(uint64_t);
     write_u64(p, phf->seed);                  p += sizeof(uint64_t);
-    memcpy(p, phf->pilots, pilots_bytes);
+    write_u64(p, (uint64_t)phf->collisions);  p += sizeof(uint64_t);
+    for (size_t b = 0; b < phf->num_buckets; b++, p += 2)
+        write_u16(p, phf->pilots[b]);
 
     return total;
 }
@@ -508,21 +368,19 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
     uint64_t num_buckets = read_u64(p); p += sizeof(uint64_t);
     uint64_t bucket_size = read_u64(p); p += sizeof(uint64_t);
     uint64_t seed        = read_u64(p); p += sizeof(uint64_t);
+    uint64_t collisions  = read_u64(p); p += sizeof(uint64_t);
 
+    if (num_keys == 0 || num_buckets == 0 || range_size == 0 || bucket_size == 0) return NULL;
+    if (num_buckets > SIZE_MAX / sizeof(uint16_t)) return NULL;
     size_t pilots_bytes = (size_t)num_buckets * sizeof(uint16_t);
     if (buf_len < PHOBIC_HEADER_SIZE + pilots_bytes) return NULL;
 
     uint16_t *pilots = malloc(pilots_bytes);
     if (!pilots) return NULL;
-    memcpy(pilots, p, pilots_bytes);
+    for (size_t b = 0; b < (size_t)num_buckets; b++)
+        pilots[b] = read_u16(p + b * 2);
 
-    phobic_phf *phf = malloc(sizeof(phobic_phf));
-    if (!phf) { free(pilots); return NULL; }
-    phf->pilots      = pilots;
-    phf->num_keys    = (size_t)num_keys;
-    phf->range_size  = (size_t)range_size;
-    phf->num_buckets = (size_t)num_buckets;
-    phf->bucket_size = (size_t)bucket_size;
-    phf->seed        = seed;
-    return phf;
+    return assemble_phf(pilots, (size_t)num_keys, (size_t)range_size,
+                        (size_t)num_buckets, (size_t)bucket_size, seed,
+                        (size_t)collisions);
 }

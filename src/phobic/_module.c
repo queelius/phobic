@@ -12,9 +12,12 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
     PyObject *keys_list;
     double alpha;
     unsigned long long seed;
-    int threads;
 
-    if (!PyArg_ParseTuple(args, "O!dKi", &PyList_Type, &keys_list, &alpha, &seed, &threads))
+    int max_retries = 100;
+    int strict = 1;
+
+    if (!PyArg_ParseTuple(args, "O!dKii", &PyList_Type, &keys_list, &alpha, &seed,
+                          &max_retries, &strict))
         return NULL;
 
     Py_ssize_t n = PyList_GET_SIZE(keys_list);
@@ -30,6 +33,8 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
         return PyErr_NoMemory();
     }
 
+    /* First pass: validate types and collect lengths. */
+    size_t total_bytes = 0;
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *item = PyList_GET_ITEM(keys_list, i);
         if (!PyBytes_Check(item)) {
@@ -37,15 +42,37 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
             PyErr_SetString(PyExc_TypeError, "all keys must be bytes");
             return NULL;
         }
-        key_ptrs[i] = PyBytes_AS_STRING(item);
         key_lens[i] = (size_t)PyBytes_GET_SIZE(item);
+        if (key_lens[i] > SIZE_MAX - total_bytes) {
+            free(key_ptrs); free(key_lens);
+            PyErr_SetString(PyExc_OverflowError, "total key data exceeds SIZE_MAX");
+            return NULL;
+        }
+        total_bytes += key_lens[i];
+    }
+
+    /* Copy key data into a flat C buffer before releasing the GIL,
+     * so the build call never touches Python-owned memory. */
+    char *key_data = malloc(total_bytes ? total_bytes : 1);
+    if (!key_data) {
+        free(key_ptrs); free(key_lens);
+        return PyErr_NoMemory();
+    }
+    size_t offset = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = PyList_GET_ITEM(keys_list, i);
+        memcpy(key_data + offset, PyBytes_AS_STRING(item), key_lens[i]);
+        key_ptrs[i] = key_data + offset;
+        offset += key_lens[i];
     }
 
     phobic_phf *phf;
     Py_BEGIN_ALLOW_THREADS
-    phf = phobic_build(key_ptrs, key_lens, (size_t)n, alpha, (uint64_t)seed, threads);
+    phf = phobic_build(key_ptrs, key_lens, (size_t)n, alpha, (uint64_t)seed,
+                       max_retries, strict);
     Py_END_ALLOW_THREADS
 
+    free(key_data);
     free(key_ptrs);
     free(key_lens);
 
@@ -132,6 +159,15 @@ static PyObject *py_bits_per_key(PyObject *self, PyObject *args) {
     return PyFloat_FromDouble(phobic_bits_per_key(phf));
 }
 
+static PyObject *py_collisions(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    if (!phf) return NULL;
+    return PyLong_FromSize_t(phf->collisions);
+}
+
 static PyMethodDef module_methods[] = {
     {"build",       py_build,       METH_VARARGS, "Build a PHF from keys"},
     {"query",       py_query,       METH_VARARGS, "Query a PHF for a key's slot"},
@@ -140,6 +176,7 @@ static PyMethodDef module_methods[] = {
     {"num_keys",    py_num_keys,    METH_VARARGS, "Get number of keys"},
     {"range_size",  py_range_size,  METH_VARARGS, "Get range size"},
     {"bits_per_key",py_bits_per_key,METH_VARARGS, "Get bits per key"},
+    {"collisions",  py_collisions,  METH_VARARGS, "Get collision count (0 for perfect PHF)"},
     {NULL, NULL, 0, NULL}
 };
 

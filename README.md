@@ -36,11 +36,8 @@ phf2 = phobic.from_bytes(data)
 ### Options
 
 ```python
-# Non-minimal: extra slots (faster build)
-phf = phobic.build(keys, alpha=1.05)
-
-# Parallel build (auto-detect cores)
-phf = phobic.build(keys, threads=0)
+# Closer to minimal: 5% overhead instead of 100% (slower build)
+phf = phobic.build(keys, alpha=0.05)
 
 # Fixed seed for reproducibility
 phf = phobic.build(keys, seed=42)
@@ -52,7 +49,7 @@ PHOBIC achieves ~2.7 bits/key for the hash structure. When used as a filter (PHF
 
 ## Performance
 
-Implemented in C11 with parallel construction via pthreads.
+Implemented in C11 with no runtime dependencies. The GIL is released during construction so other Python threads can run concurrently.
 
 ## License
 
