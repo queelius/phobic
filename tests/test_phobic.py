@@ -107,6 +107,11 @@ def test_seed_out_of_range_raises():
         phobic.build(["a", "b"], seed=2**64)
 
 
+def test_negative_alpha_raises():
+    with pytest.raises(ValueError):
+        phobic.build(["a", "b"], alpha=-0.5)
+
+
 def test_perfect_build_is_perfect():
     keys = [f"key_{i}" for i in range(500)]
     phf = phobic.build(keys)

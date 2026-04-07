@@ -48,7 +48,7 @@ class PHF:
 
     @property
     def collisions(self):
-        """Number of collisions (0 for a perfect hash function)."""
+        """Number of keys that landed on an already-occupied slot (0 = perfect)."""
         return _collisions(self._handle)
 
     @property
@@ -102,7 +102,11 @@ def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True):
     seed = int(seed)
     if not (0 <= seed < 2**64):
         raise ValueError(f"seed must be in [0, 2**64), got {seed}")
+    if alpha < 0:
+        raise ValueError(f"alpha must be >= 0, got {alpha}")
     raw_keys = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
+    if len(set(raw_keys)) != len(raw_keys):
+        raise ValueError("keys must be unique")
     handle = _build(raw_keys, float(alpha), seed, int(max_retries), int(strict))
     return PHF(handle)
 

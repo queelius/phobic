@@ -1,0 +1,21 @@
+# Build artifacts
+*.so
+*.o
+*.egg-info/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing / benchmarks
+.pytest_cache/
+.benchmarks/
+
+# IDE
+.vscode/
+.idea/

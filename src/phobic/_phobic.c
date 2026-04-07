@@ -1,5 +1,6 @@
 #include "_phobic.h"
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 /* ── little-endian load helpers ──────────────────────────────────────── */
@@ -229,10 +230,17 @@ static phobic_phf *try_build(const dual_hash *hashes, size_t num_keys,
         }
         if (!found) {
             if (strict) { failed = 1; break; }
-            /* Non-strict: use pilot 0, count each key in this bucket
-             * as a collision (they may land on already-occupied slots). */
+            /* Non-strict: fall back to pilot 0.  Compute actual slots,
+             * mark them in the bitset, and count only the keys whose
+             * slot was already occupied (true collisions). */
             pilots[b] = 0;
-            collisions += bsize;
+            for (size_t k = 0; k < bsize; k++) {
+                size_t ki = bl.members[bstart + k];
+                size_t slot = slot_with_pilot(hashes[ki].h2, 0, range_size);
+                if (bitset_test(occupied, slot))
+                    collisions++;
+                bitset_set(occupied, slot);
+            }
         }
     }
 
