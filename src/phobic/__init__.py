@@ -1,6 +1,6 @@
 """phobic: Fast minimal perfect hash functions."""
 
-__all__ = ['PHF', 'build', 'from_bytes']
+__all__ = ['PHF', 'build', 'from_bytes', 'PartitionedPHF', 'build_partitioned']
 
 from phobic._module import (
     build as _build,
@@ -114,3 +114,8 @@ def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True):
 def from_bytes(data):
     """Deserialize a PHF from bytes."""
     return PHF.from_bytes(data)
+
+
+# Partitioned (parallel) build. Defined in a separate module to keep
+# the core API small; re-exported here for discoverability.
+from phobic.partitioned import PartitionedPHF, build_partitioned  # noqa: E402
