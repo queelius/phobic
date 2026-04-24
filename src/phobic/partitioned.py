@@ -237,7 +237,7 @@ def build_partitioned(
     # Build each shard in parallel. phobic.build releases the GIL, so a
     # Python thread pool delivers real parallelism.
     def _build_shard(ks: list[bytes]) -> PHF:
-        # Empty shards still need a PHF placeholder — but phobic.build
+        # Empty shards still need a PHF placeholder, but phobic.build
         # rejects empty inputs. Give such shards one dummy key; the
         # range contributes 0 to the total offset because we compute
         # offsets from actual shard range_size after build.

@@ -68,6 +68,40 @@ PHOBIC achieves ~1 bit/key for the hash structure at 100k keys. When used as a f
 
 C11 core, single-threaded. The GIL is released during construction so other Python threads can run concurrently. Typical build times: ~0.5 us/key at n=1k, ~1.8 us/key at n=100k. Query throughput: ~2M queries/sec from Python (~500 ns/query including str-to-bytes encoding).
 
+## Scale: partitioned builds
+
+For n above ~500K, single-threaded pilot search becomes the bottleneck; at n=1M the default parameters take ~100 s and above ~2M the build can fail entirely. Use `build_partitioned` to shard across cores:
+
+```python
+import phobic
+
+keys = [f"key_{i}".encode() for i in range(10_000_000)]
+
+# Uses ThreadPoolExecutor + the GIL-releasing C build to parallelize.
+phf = phobic.build_partitioned(keys)
+
+phf.num_keys      # 10_000_000
+phf.num_shards    # 666 (auto: 15K keys per shard)
+phf.bits_per_key  # ~1.18 (per-shard headers + partition wrapper)
+phf[b"key_42"]    # unique slot in [0, phf.range_size)
+
+# Wire-serializable with its own magic bytes.
+data = phf.to_bytes()
+phf2 = phobic.PartitionedPHF.from_bytes(data)
+```
+
+Measured speedup (8-core machine):
+
+| n | serial | partitioned | speedup |
+|---:|-------:|-----------:|--------:|
+| 100K | 0.10 s | 0.18 s | 0.6x (threading overhead wins at small n) |
+| 500K | 1.08 s | 0.94 s | 1.2x |
+| 1M | 133.5 s | 2.0 s | **67.7x** |
+| 2M | fails | 4.0 s | serial unbuildable |
+| 10M | - | 20.6 s | - |
+
+At small `n` the per-shard metadata makes partitioning slightly slower. From roughly 500K up it wins decisively; at 1M+ it is often the only way to build at all. See [`src/phobic/partitioned.py`](src/phobic/partitioned.py) for the implementation.
+
 ## Demo
 
 See [`demo.ipynb`](demo.ipynb) for an interactive walkthrough covering the API, alpha trade-offs, space efficiency, serialization, and a matplotlib plot of how collisions decrease with retry budget.
