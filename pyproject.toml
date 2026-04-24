@@ -26,3 +26,8 @@ Repository = "https://github.com/queelius/phobic"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: long-running tests (scale 1M/10M, exclude with -m 'not slow')",
+]
+# Exclude slow tests by default; opt in with -m slow.
+addopts = "-m 'not slow'"

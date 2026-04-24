@@ -7,11 +7,45 @@ Skip during normal test runs:
 
     pytest tests/ --benchmark-skip
 """
+import random
 import pytest
 import phobic
 
 
+# ── key generators: four distribution shapes ──────────────────────────────
+#
+# Borrowed from maph's benchmark suite. Each generator is deterministic
+# given the seed and returns unique bytes keys.
+
+def _keys_random(n, seed=42):
+    """Uniform 16-byte random keys."""
+    rng = random.Random(seed)
+    return [bytes(rng.randint(0, 255) for _ in range(16)) for _ in range(n)]
+
+
+def _keys_sequential(n):
+    """Zero-padded decimal strings. Low entropy; tests hash quality."""
+    return [f"{i:010d}".encode() for i in range(n)]
+
+
+def _keys_url(n, seed=42):
+    """Synthetic URL-shaped keys with a common prefix + random suffix."""
+    rng = random.Random(seed)
+    prefix = "https://example.com/v1/resource/"
+    return [(prefix + rng.randbytes(16).hex()).encode() for _ in range(n)]
+
+
+def _keys_variable(n, seed=42):
+    """Random-length keys in [4, 64] bytes. Amortized hashing cost."""
+    rng = random.Random(seed)
+    return [
+        bytes(rng.randint(0, 255) for _ in range(rng.randint(4, 64)))
+        for _ in range(n)
+    ]
+
+
 def _keys(n):
+    """Legacy default (used by existing tests). Low-entropy string keys."""
     return [f"key_{i:010d}" for i in range(n)]
 
 
@@ -45,6 +79,25 @@ def test_build_scaling(benchmark, n):
     keys = _keys(n)
     phf = benchmark(phobic.build, keys, seed=42)
     assert phf.num_keys == n
+
+
+# ── build: distribution sensitivity ───────────────────────────────────────
+#
+# PHOBIC should be robust to non-uniform key shapes (wyhash-style mix
+# folds low-entropy input well). These benchmarks quantify the effect
+# so a regression would be obvious.
+
+@pytest.mark.parametrize("dist,gen", [
+    ("random",     lambda n: _keys_random(n)),
+    ("sequential", lambda n: _keys_sequential(n)),
+    ("url",        lambda n: _keys_url(n)),
+    ("variable",   lambda n: _keys_variable(n)),
+])
+def test_build_by_distribution(benchmark, dist, gen):
+    """Build time across four key-distribution shapes at n=10K."""
+    keys = gen(10_000)
+    phf = benchmark(phobic.build, keys, seed=42)
+    assert phf.num_keys == 10_000
 
 
 
