@@ -118,6 +118,34 @@ def test_query_bulk_10k(benchmark, phf_10k, keys_10k):
     benchmark(_run)
 
 
+def test_query_lookup_batch_10k(benchmark, phf_10k, keys_10k):
+    """Batch query throughput: phf.lookup(keys_list) in one call."""
+    benchmark(phf_10k.lookup, keys_10k)
+
+
+# ── partitioned build: parallel scaling ───────────────────────────────────
+
+@pytest.mark.parametrize("n", [100_000, 500_000, 1_000_000])
+def test_build_partitioned_scaling(benchmark, n):
+    """Build time vs key count for the partitioned (parallel) path.
+
+    Compare to test_build_scaling at the same n: at 100K the
+    serial build is faster (per-shard overhead dominates); from
+    500K up, partitioned wins; at 1M+ partitioned is the only
+    practical option.
+    """
+    keys = _keys(n)
+    phf = benchmark(phobic.build_partitioned, keys, shard_seed=42)
+    assert phf.num_keys == n
+
+
+def test_query_partitioned_lookup_500k(benchmark):
+    """Batch query through a partitioned PHF: shards each batch internally."""
+    keys = _keys(500_000)
+    phf = phobic.build_partitioned(keys, shard_seed=42)
+    benchmark(phf.lookup, keys[:50_000])
+
+
 # ── serialization round-trip ──────────────────────────────────────────────
 
 def test_serialize_100k(benchmark, phf_100k):
