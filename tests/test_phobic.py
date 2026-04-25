@@ -69,6 +69,29 @@ def test_large_key_set():
     assert len(slots) == len(sample)
 
 
+def test_lookup_batch_matches_scalar():
+    keys = [f"key_{i}" for i in range(500)]
+    phf = phobic.build(keys, seed=42)
+    batch = phf.lookup(keys)
+    scalar = [phf[k] for k in keys]
+    assert batch == scalar
+
+
+def test_lookup_accepts_bytes_and_str():
+    phf = phobic.build([b"a", b"b", b"c"], seed=1)
+    a = phf.lookup(["a", "b", "c"])
+    b = phf.lookup([b"a", b"b", b"c"])
+    assert a == b
+
+
+def test_partitioned_lookup_matches_scalar():
+    keys = [f"k{i}".encode() for i in range(1000)]
+    phf = phobic.build_partitioned(keys, num_shards=8, shard_seed=42)
+    batch = phf.lookup(keys)
+    scalar = [phf[k] for k in keys]
+    assert batch == scalar
+
+
 def test_empty_keys_raises():
     with pytest.raises((ValueError, RuntimeError)):
         phobic.build([])

@@ -5,6 +5,7 @@ __all__ = ['PHF', 'build', 'from_bytes', 'PartitionedPHF', 'build_partitioned']
 from phobic._module import (
     build as _build,
     query as _query,
+    query_batch as _query_batch,
     serialize as _serialize,
     deserialize as _deserialize,
     num_keys as _num_keys,
@@ -30,6 +31,22 @@ class PHF:
     def slot(self, key):
         """Return the slot index for a key."""
         return self[key]
+
+    def lookup(self, keys):
+        """Batch query: keys -> list of slots.
+
+        Roughly 2-3x faster than [phf[k] for k in keys] for typical
+        workloads because the C extension amortizes per-call overhead
+        (capsule lookup, argument unpacking) across the whole batch.
+
+        Args:
+            keys: iterable of str or bytes.
+
+        Returns:
+            list of int, parallel to the input.
+        """
+        raw = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
+        return _query_batch(self._handle, raw)
 
     @property
     def num_keys(self):

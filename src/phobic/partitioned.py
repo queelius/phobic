@@ -87,6 +87,37 @@ class PartitionedPHF:
     def slot(self, key):
         return self[key]
 
+    def lookup(self, keys):
+        """Batch query across shards.
+
+        Groups keys by their target shard, calls the shard's batch query
+        once per shard, then assembles the result in input order.
+        Substantially faster than ``[phf[k] for k in keys]`` for large
+        batches because per-shard work is amortized over many keys.
+        """
+        raw = [
+            k.encode("utf-8") if isinstance(k, str) else bytes(k)
+            for k in keys
+        ]
+        n = len(raw)
+        # Bucket keys by shard, remembering original index to reassemble.
+        per_shard_keys: list[list[bytes]] = [[] for _ in range(self._num_shards)]
+        per_shard_idx: list[list[int]] = [[] for _ in range(self._num_shards)]
+        for i, k in enumerate(raw):
+            s = _shard_hash(k, self._shard_seed, self._num_shards)
+            per_shard_keys[s].append(k)
+            per_shard_idx[s].append(i)
+
+        out = [0] * n
+        for s in range(self._num_shards):
+            if not per_shard_keys[s]:
+                continue
+            slots = self._shards[s].lookup(per_shard_keys[s])
+            offset = self._offsets[s]
+            for i, slot in zip(per_shard_idx[s], slots):
+                out[i] = offset + slot
+        return out
+
     def __len__(self):
         return self.num_keys
 
