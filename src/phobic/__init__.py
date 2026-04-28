@@ -1,6 +1,13 @@
 """phobic: Fast minimal perfect hash functions."""
 
-__all__ = ['PHF', 'build', 'from_bytes', 'PartitionedPHF', 'build_partitioned']
+__all__ = [
+    'PHF',
+    'build',
+    'build_with_slots',
+    'from_bytes',
+    'PartitionedPHF',
+    'build_partitioned',
+]
 
 from phobic._module import (
     build as _build,
@@ -94,7 +101,41 @@ class PHF:
                 f"{collision_str})")
 
 
-def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True):
+def _prepare_build(keys, alpha, seed, max_retries, strict, bucket_size):
+    """Validate args, encode keys to bytes, run the C build.
+
+    Shared by build() and build_with_slots(). Returns (handle, raw_keys)
+    so callers can either wrap the handle alone or use raw_keys for a
+    follow-up batch query without re-encoding.
+    """
+    if seed is None:
+        import random
+        seed = random.getrandbits(64)
+    seed = int(seed)
+    if not (0 <= seed < 2**64):
+        raise ValueError(f"seed must be in [0, 2**64), got {seed}")
+    if alpha < 0:
+        raise ValueError(f"alpha must be >= 0, got {alpha}")
+    if bucket_size is None:
+        bucket_size_c = 0  # 0 = let C pick the auto default
+    else:
+        bucket_size_c = int(bucket_size)
+        if bucket_size_c < 1:
+            raise ValueError(
+                f"bucket_size must be >= 1 or None for auto, got {bucket_size}"
+            )
+    raw_keys = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
+    if len(set(raw_keys)) != len(raw_keys):
+        raise ValueError("keys must be unique")
+    handle = _build(
+        raw_keys, float(alpha), seed,
+        int(max_retries), int(strict), bucket_size_c,
+    )
+    return handle, raw_keys
+
+
+def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True,
+          bucket_size=None):
     """Build a perfect hash function from a list of keys.
 
     Args:
@@ -109,23 +150,47 @@ def build(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True):
                 be found within max_retries. If False, fall back to a non-perfect
                 hash; PHF.collisions will be > 0. The best result across all
                 attempts (fewest collisions) is returned.
+        bucket_size: Average keys per bucket. None (default) picks
+                ceil(log2(num_keys)), which minimises bits/key. Smaller values
+                build dramatically faster at small N at the cost of more
+                bits/key. Larger values rarely help and often fail to build.
 
     Returns:
         PHF object. Check PHF.is_perfect / PHF.collisions when strict=False.
     """
-    if seed is None:
-        import random
-        seed = random.getrandbits(64)
-    seed = int(seed)
-    if not (0 <= seed < 2**64):
-        raise ValueError(f"seed must be in [0, 2**64), got {seed}")
-    if alpha < 0:
-        raise ValueError(f"alpha must be >= 0, got {alpha}")
-    raw_keys = [k.encode('utf-8') if isinstance(k, str) else k for k in keys]
-    if len(set(raw_keys)) != len(raw_keys):
-        raise ValueError("keys must be unique")
-    handle = _build(raw_keys, float(alpha), seed, int(max_retries), int(strict))
+    handle, _ = _prepare_build(keys, alpha, seed, max_retries, strict, bucket_size)
     return PHF(handle)
+
+
+def build_with_slots(keys, *, alpha=1.0, seed=None, max_retries=100, strict=True,
+                     bucket_size=None):
+    """Build a PHF and return both the PHF and the slot for each input key.
+
+    Equivalent to (but faster than):
+
+        phf = phobic.build(keys, ...)
+        slots = phf.lookup(keys)
+        return phf, slots
+
+    Useful when the caller is going to immediately index a slot array by
+    key (e.g. cipher_maps PHFCipherMap fills slot[phf[k]] = encode(value)
+    for every key right after construction). Skipping the redundant
+    Python-side encode pass and one round of validation roughly halves the
+    per-key overhead at construction.
+
+    Args:
+        Same as build().
+
+    Returns:
+        (PHF, list[int]) where slots[i] == phf[keys[i]] for every i. With
+        strict=False the slot list may contain duplicates whenever
+        phf.collisions > 0.
+    """
+    handle, raw_keys = _prepare_build(
+        keys, alpha, seed, max_retries, strict, bucket_size,
+    )
+    slots = _query_batch(handle, raw_keys)
+    return PHF(handle), slots
 
 
 def from_bytes(data):

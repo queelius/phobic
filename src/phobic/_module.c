@@ -15,10 +15,16 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
 
     int max_retries = 100;
     int strict = 1;
+    Py_ssize_t bucket_size = 0;  /* 0 = auto (ceil(log2 N)) */
 
-    if (!PyArg_ParseTuple(args, "O!dKii", &PyList_Type, &keys_list, &alpha, &seed,
-                          &max_retries, &strict))
+    if (!PyArg_ParseTuple(args, "O!dKiin", &PyList_Type, &keys_list, &alpha, &seed,
+                          &max_retries, &strict, &bucket_size))
         return NULL;
+
+    if (bucket_size < 0) {
+        PyErr_SetString(PyExc_ValueError, "bucket_size must be >= 0");
+        return NULL;
+    }
 
     Py_ssize_t n = PyList_GET_SIZE(keys_list);
     if (n == 0) {
@@ -69,7 +75,7 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
     phobic_phf *phf;
     Py_BEGIN_ALLOW_THREADS
     phf = phobic_build(key_ptrs, key_lens, (size_t)n, alpha, (uint64_t)seed,
-                       max_retries, strict);
+                       max_retries, strict, (size_t)bucket_size);
     Py_END_ALLOW_THREADS
 
     free(key_data);

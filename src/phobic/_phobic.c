@@ -265,12 +265,23 @@ size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len) {
 
 phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
                           size_t num_keys, double alpha, uint64_t seed,
-                          int max_retries, int strict) {
+                          int max_retries, int strict,
+                          size_t bucket_size_param) {
     if (num_keys == 0) return NULL;
     if (max_retries <= 0) max_retries = 1;
 
     static const int BUMP_INTERVAL = 10;
     static const double ALPHA_BUMP = 0.005;
+
+    /* Resolve bucket_size once: it does not depend on the retry seed. */
+    size_t bucket_size;
+    if (bucket_size_param > 0) {
+        bucket_size = bucket_size_param;
+    } else {
+        bucket_size = (size_t)ceil(log2((double)num_keys));
+        if (bucket_size < 1) bucket_size = 1;
+    }
+    size_t num_buckets = (num_keys + bucket_size - 1) / bucket_size;
 
     phobic_phf *best = NULL; /* non-strict: track fewest collisions */
 
@@ -280,10 +291,6 @@ phobic_phf *phobic_build(const char **keys, const size_t *key_lens,
 
         size_t range_size = (size_t)ceil((double)num_keys * (1.0 + cur_alpha));
         if (range_size < num_keys + 1) range_size = num_keys + 1;
-
-        size_t bucket_size = (size_t)ceil(log2((double)num_keys));
-        if (bucket_size < 1) bucket_size = 1;
-        size_t num_buckets = (num_keys + bucket_size - 1) / bucket_size;
 
         dual_hash *hashes = malloc(num_keys * sizeof(dual_hash));
         if (!hashes) { phobic_free(best); return NULL; }

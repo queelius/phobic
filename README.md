@@ -35,6 +35,18 @@ data = phf.to_bytes()
 phf2 = phobic.from_bytes(data)
 ```
 
+### Build with slot map
+
+When you'll immediately fill a slot array indexed by `phf[k]` for every key (a common pattern in PHF-backed retrieval and cipher-map structures), `build_with_slots` returns the slot list as a build by-product, saving a redundant pass:
+
+```python
+phf, slots = phobic.build_with_slots(keys)
+# slots[i] == phf[keys[i]] for every i
+table = [None] * phf.range_size
+for i, s in enumerate(slots):
+    table[s] = values[i]
+```
+
 ### Options
 
 ```python
@@ -46,6 +58,13 @@ phf = phobic.build(keys, seed=42)
 
 # Control retry budget (default 100)
 phf = phobic.build(keys, max_retries=200)
+
+# Average keys per bucket. None (default) picks ceil(log2 N), which
+# minimises bits/key. Smaller values (e.g. 8) build dramatically
+# faster at large N, at the cost of ~2x bits/key. At N=100K keys,
+# bucket_size=8 is ~6x faster than the default for cipher-maps-style
+# workloads. See .claude/SWEEP_BUCKET_SIZE.md for the full sweep.
+phf = phobic.build(keys, bucket_size=8)
 ```
 
 ### Non-perfect builds

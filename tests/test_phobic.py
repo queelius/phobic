@@ -187,3 +187,133 @@ def test_serialization_preserves_collisions():
     phf2 = phobic.from_bytes(data)
     assert phf2.collisions == phf.collisions
     assert phf2.is_perfect == phf.is_perfect
+
+
+def test_build_with_slots_returns_pair():
+    keys = [f"k{i}" for i in range(100)]
+    result = phobic.build_with_slots(keys, seed=0)
+    assert isinstance(result, tuple) and len(result) == 2
+    phf, slots = result
+    assert isinstance(phf, phobic.PHF)
+    assert isinstance(slots, list)
+    assert len(slots) == len(keys)
+
+
+def test_build_with_slots_matches_scalar():
+    keys = [f"key_{i}" for i in range(500)]
+    phf, slots = phobic.build_with_slots(keys, seed=42)
+    assert slots == [phf[k] for k in keys]
+
+
+def test_build_with_slots_bytes_keys():
+    keys = [f"k{i}".encode() for i in range(200)]
+    phf, slots = phobic.build_with_slots(keys, seed=0)
+    assert slots == [phf[k] for k in keys]
+    assert len(set(slots)) == len(slots)
+
+
+def test_build_with_slots_str_bytes_equivalence():
+    """str keys are encoded as UTF-8, so they should yield the same slots
+    as the equivalent bytes keys at the same seed."""
+    str_keys = ["alpha", "beta", "gamma"]
+    byte_keys = [k.encode("utf-8") for k in str_keys]
+    _, slots_str = phobic.build_with_slots(str_keys, seed=7)
+    _, slots_bytes = phobic.build_with_slots(byte_keys, seed=7)
+    assert slots_str == slots_bytes
+
+
+def test_build_with_slots_empty_raises():
+    with pytest.raises((ValueError, RuntimeError)):
+        phobic.build_with_slots([])
+
+
+def test_build_with_slots_duplicate_raises():
+    with pytest.raises((ValueError, RuntimeError)):
+        phobic.build_with_slots(["a", "b", "a"])
+
+
+def test_build_with_slots_negative_alpha_raises():
+    with pytest.raises(ValueError):
+        phobic.build_with_slots(["a", "b"], alpha=-0.1)
+
+
+def test_build_with_slots_seed_out_of_range_raises():
+    with pytest.raises(ValueError):
+        phobic.build_with_slots(["a", "b"], seed=2**64)
+
+
+def test_build_with_slots_strict_false_consistent():
+    """With strict=False the build may produce collisions, but the slot
+    list must still agree with scalar queries on the returned PHF.
+    Slots are unique iff phf.is_perfect."""
+    keys = [f"k{i}" for i in range(200)]
+    phf, slots = phobic.build_with_slots(keys, strict=False, max_retries=5)
+    assert slots == [phf[k] for k in keys]
+    assert (len(set(slots)) == len(slots)) == phf.is_perfect
+
+
+# ── bucket_size parameter ──────────────────────────────────────────────
+
+
+def test_bucket_size_explicit_small_builds():
+    """Small fixed buckets always build at any reasonable N."""
+    keys = [f"k{i}" for i in range(1000)]
+    phf = phobic.build(keys, bucket_size=4, seed=0)
+    slots = {phf[k] for k in keys}
+    assert len(slots) == 1000
+
+
+def test_bucket_size_default_matches_none():
+    """Passing bucket_size=None must behave identically to the default."""
+    keys = [f"k{i}" for i in range(200)]
+    phf_none = phobic.build(keys, seed=42)
+    phf_default = phobic.build(keys, bucket_size=None, seed=42)
+    assert all(phf_none[k] == phf_default[k] for k in keys)
+
+
+def test_bucket_size_changes_mapping():
+    """Different bucket_size values (with the same seed) must produce
+    different slot assignments. The mapping depends on num_buckets,
+    which depends on bucket_size."""
+    keys = [f"k{i}" for i in range(200)]
+    phf4 = phobic.build(keys, bucket_size=4, seed=0)
+    phf8 = phobic.build(keys, bucket_size=8, seed=0)
+    differing = sum(1 for k in keys if phf4[k] != phf8[k])
+    assert differing > 0
+
+
+def test_bucket_size_smaller_uses_more_bits_per_key():
+    """Smaller buckets have less pilot amortization, so bits/key rises."""
+    keys = [f"k{i}" for i in range(10000)]
+    bpk_small = phobic.build(keys, bucket_size=2, seed=1).bits_per_key
+    bpk_large = phobic.build(keys, bucket_size=10, seed=1).bits_per_key
+    assert bpk_small > bpk_large
+
+
+def test_bucket_size_zero_raises():
+    """bucket_size=0 is reserved as the C-side auto sentinel; Python rejects it."""
+    with pytest.raises(ValueError):
+        phobic.build(["a", "b"], bucket_size=0)
+
+
+def test_bucket_size_negative_raises():
+    with pytest.raises(ValueError):
+        phobic.build(["a", "b"], bucket_size=-1)
+
+
+def test_bucket_size_serialization_roundtrip():
+    """Serialized PHF must round-trip the bucket_size invisibly: queries
+    on the deserialized PHF must match the original."""
+    keys = [f"k{i}" for i in range(500)]
+    phf = phobic.build(keys, bucket_size=4, seed=7)
+    phf2 = phobic.from_bytes(phf.to_bytes())
+    assert all(phf[k] == phf2[k] for k in keys)
+    assert phf2.range_size == phf.range_size
+
+
+def test_bucket_size_flows_through_build_with_slots():
+    """build_with_slots must accept and honour bucket_size."""
+    keys = [f"k{i}" for i in range(300)]
+    phf, slots = phobic.build_with_slots(keys, bucket_size=4, seed=3)
+    assert slots == [phf[k] for k in keys]
+    assert len(set(slots)) == len(slots)
