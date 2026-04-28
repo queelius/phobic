@@ -1,0 +1,4 @@
+# C headers are #included by source files but are not "sources" themselves,
+# so setuptools won't add them to the sdist by default. Without this file
+# the sdist would compile-fail on `pip install` because _phobic.h is absent.
+include src/phobic/*.h
