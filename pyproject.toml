@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phobic"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast minimal perfect hash functions"
 readme = "README.md"
 license = "MIT"
