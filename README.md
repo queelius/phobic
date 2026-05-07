@@ -44,6 +44,7 @@ phf = phobic.build(
     num_threads=None,   # None = auto (CPU count)
     bucket_size=None,   # None = ceil(log2(per_shard_N))
     max_retries=100,    # per-shard retry budget on the pilot search
+    assume_unique=False, # skip the O(N) Python-side uniqueness check (opt-in)
 )
 ```
 
@@ -73,16 +74,17 @@ Determinism is preserved: same `seed` and same `num_shards` produce byte-identic
 
 Measured on a 12-core machine, default `load_factor=0.5`, 16-byte uniform keys (cipher-maps shape):
 
-| N | num_shards | bpk | build @ 1 thread | build @ 12 threads | speedup |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 1 | 2.37 | <1 ms | <1 ms | (tiny) |
-| 100K | 7 | 1.17 | 57 ms | 26 ms | 2.2x |
-| 1M | 63 | 1.17 | 636 ms | 306 ms | 2.1x |
-| 10M | 625 | 1.16 | 7.42 s | 3.72 s | 2.0x |
+| N | num_shards | bpk | build @ 12 threads | with `assume_unique=True` |
+|---:|---:|---:|---:|---:|
+| 100K | 7 | 1.17 | 26 ms | 26 ms |
+| 1M | 63 | 1.17 | 306 ms | ~250 ms |
+| 10M | 625 | 1.16 | **2.37 s** | **1.18 s** |
 
-vs phobic 0.2.0: 1M parallel went from 2.0 s to 0.34 s (5.9x), and 10M from "would not finish" serially to 7.4 s serial / 3.7 s parallel.
+`assume_unique=True` skips the Python-side uniqueness check (a 2-second `set(raw)` hash at 10M keys). For callers whose keys are unique by construction (e.g. cipher-maps, HMAC outputs), this is pure win.
 
-vs maph's `partitioned_phf<phobic4>` (the reference in the sibling research repo): at 10M, phobic 0.3.0 is 2x faster and uses 2.4x fewer bits per key. See `.claude/SWEEP_0_3_0.md` for the full sweep.
+vs phobic 0.2.0: 1M parallel went from 2.0 s to 0.34 s (5.9x). 10M went from "would not finish" serially in 0.2.0 to ~1.2 s parallel in 0.3.1 with `assume_unique=True`.
+
+vs maph's `partitioned_phf<phobic4>` (the reference in the sibling research repo): at 10M, phobic 0.3.1 is 6x faster and uses 2.4x fewer bits per key. See `.claude/SWEEP_0_3_0.md` for the full sweep.
 
 ## Wire format
 

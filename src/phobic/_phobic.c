@@ -11,6 +11,19 @@
 #define PHOBIC_HAVE_PTHREAD 0
 #endif
 
+#ifdef PHOBIC_PROFILE
+#include <time.h>
+#include <stdio.h>
+static inline double pp_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#define PP_REPORT(label, t0) \
+    fprintf(stderr, "[phobic-profile] %-40s %7.1f ms\n", \
+            (label), (pp_now() - (t0)) * 1000.0)
+#endif
+
 /* ── little-endian load helpers ──────────────────────────────────────── */
 
 static inline uint64_t load_u64_le(const uint8_t *p) {
@@ -498,6 +511,9 @@ phobic_phf *phobic_build_with_diag(const char **keys,
     size_t *shard_counts = calloc(num_shards, sizeof(size_t));
     if (!shard_counts) { phobic_free(phf); return NULL; }
 
+#ifdef PHOBIC_PROFILE
+    double pp_dist_t0 = pp_now();
+#endif
     /* If num_shards == 1, every key is in shard 0; skip the hash computation. */
     if (num_shards == 1) {
         shard_counts[0] = num_keys;
@@ -507,6 +523,9 @@ phobic_phf *phobic_build_with_diag(const char **keys,
             shard_counts[s]++;
         }
     }
+#ifdef PHOBIC_PROFILE
+    PP_REPORT("shard distribution count pass", pp_dist_t0);
+#endif
 
     /* Allocate per-shard pointer/len arrays. */
     const char ***shard_keys = calloc(num_shards, sizeof(const char **));
@@ -541,6 +560,9 @@ phobic_phf *phobic_build_with_diag(const char **keys,
         phobic_free(phf);
         return NULL;
     }
+#ifdef PHOBIC_PROFILE
+    double pp_scatter_t0 = pp_now();
+#endif
     if (num_shards == 1) {
         for (size_t i = 0; i < num_keys; i++) {
             shard_keys[0][i] = keys[i];
@@ -555,6 +577,10 @@ phobic_phf *phobic_build_with_diag(const char **keys,
         }
     }
     free(write_pos);
+#ifdef PHOBIC_PROFILE
+    PP_REPORT("shard scatter pass", pp_scatter_t0);
+    double pp_build_t0 = pp_now();
+#endif
 
     /* Build each shard. Threaded when num_threads > 1 and pthread is available;
      * serial fallback otherwise. Both paths populate per-shard `results` and
@@ -631,6 +657,9 @@ phobic_phf *phobic_build_with_diag(const char **keys,
         }
     }
 
+#ifdef PHOBIC_PROFILE
+    PP_REPORT("per-shard build (parallel section)", pp_build_t0);
+#endif
     /* Find the first failed shard, if any. */
     int build_failed = 0;
     int failed_shard = -1;

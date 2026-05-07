@@ -2,6 +2,19 @@
 #include <Python.h>
 #include "_phobic.h"
 
+#ifdef PHOBIC_PROFILE
+#include <time.h>
+#include <stdio.h>
+static inline double pp_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#define PP_REPORT(label, t0) \
+    fprintf(stderr, "[phobic-profile] %-40s %7.1f ms\n", \
+            (label), (pp_now() - (t0)) * 1000.0)
+#endif
+
 /* phobic 0.3.0 Python C extension.
  *
  * Public surface (called from phobic/__init__.py):
@@ -65,8 +78,18 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
         return PyErr_NoMemory();
     }
 
-    /* Validate types and collect lengths. */
-    size_t total_bytes = 0;
+#ifdef PHOBIC_PROFILE
+    double pp_validate_t0 = pp_now();
+#endif
+    /* Single pass: validate types, collect lengths, point at PyBytes data.
+     *
+     * Safety: PyBytes is immutable; the buffer returned by PyBytes_AS_STRING
+     * stays valid until the bytes object is reclaimed. The keys_list
+     * argument is borrowed from the caller's tuple, which is alive for
+     * the whole duration of py_build (including across the GIL release
+     * below), so each PyBytes inside keys_list is alive too. We can read
+     * the bytes data with the GIL released; we just cannot call any
+     * Python C API on these pointers. */
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *item = PyList_GET_ITEM(keys_list, i);
         if (!PyBytes_Check(item)) {
@@ -75,28 +98,12 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
             return NULL;
         }
         key_lens[i] = (size_t)PyBytes_GET_SIZE(item);
-        if (key_lens[i] > SIZE_MAX - total_bytes) {
-            free(key_ptrs); free(key_lens);
-            PyErr_SetString(PyExc_OverflowError, "total key data exceeds SIZE_MAX");
-            return NULL;
-        }
-        total_bytes += key_lens[i];
+        key_ptrs[i] = PyBytes_AS_STRING(item);
     }
-
-    /* Copy keys to a flat C buffer so the build (under released GIL)
-     * never touches Python memory. */
-    char *key_data = malloc(total_bytes ? total_bytes : 1);
-    if (!key_data) {
-        free(key_ptrs); free(key_lens);
-        return PyErr_NoMemory();
-    }
-    size_t offset = 0;
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *item = PyList_GET_ITEM(keys_list, i);
-        memcpy(key_data + offset, PyBytes_AS_STRING(item), key_lens[i]);
-        key_ptrs[i] = key_data + offset;
-        offset += key_lens[i];
-    }
+#ifdef PHOBIC_PROFILE
+    PP_REPORT("py_build: validate + collect pass", pp_validate_t0);
+    double pp_build_t0 = pp_now();
+#endif
 
     phobic_build_opts opts = {
         .load_factor = load_factor,
@@ -113,7 +120,10 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
     phf = phobic_build_with_diag(key_ptrs, key_lens, (size_t)n, &opts, &diag);
     Py_END_ALLOW_THREADS
 
-    free(key_data);
+#ifdef PHOBIC_PROFILE
+    PP_REPORT("py_build: phobic_build_with_diag (parallel C)", pp_build_t0);
+#endif
+
     free(key_ptrs);
     free(key_lens);
 
@@ -161,9 +171,10 @@ static PyObject *py_query(PyObject *self, PyObject *args) {
     return PyLong_FromSize_t(slot);
 }
 
-/* Batch query. Copies all keys into a flat buffer, releases the GIL,
- * runs the C batch query (single-threaded in 3a), then packages the
- * result into a Python list. */
+/* Batch query. Collects PyBytes pointers without copying (PyBytes is
+ * immutable; keys_list keeps each item alive across the GIL release).
+ * Releases the GIL, runs the C batch query (parallel above the
+ * threshold), then packages results into a Python list. */
 static PyObject *py_query_batch(PyObject *self, PyObject *args) {
     (void)self;
     PyObject *capsule;
@@ -188,8 +199,8 @@ static PyObject *py_query_batch(PyObject *self, PyObject *args) {
         return PyErr_NoMemory();
     }
 
-    /* Validate types and pack into flat buffer (so we can drop the GIL). */
-    size_t total_bytes = 0;
+    /* Single pass: validate types, collect lengths and pointers.
+     * (See py_build for the safety argument.) */
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *item = PyList_GET_ITEM(keys_list, i);
         if (!PyBytes_Check(item)) {
@@ -198,24 +209,7 @@ static PyObject *py_query_batch(PyObject *self, PyObject *args) {
             return NULL;
         }
         key_lens[i] = (size_t)PyBytes_GET_SIZE(item);
-        if (key_lens[i] > SIZE_MAX - total_bytes) {
-            free(key_ptrs); free(key_lens); free(out_slots);
-            PyErr_SetString(PyExc_OverflowError, "total key data exceeds SIZE_MAX");
-            return NULL;
-        }
-        total_bytes += key_lens[i];
-    }
-    char *key_data = malloc(total_bytes ? total_bytes : 1);
-    if (!key_data) {
-        free(key_ptrs); free(key_lens); free(out_slots);
-        return PyErr_NoMemory();
-    }
-    size_t offset = 0;
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *item = PyList_GET_ITEM(keys_list, i);
-        memcpy(key_data + offset, PyBytes_AS_STRING(item), key_lens[i]);
-        key_ptrs[i] = key_data + offset;
-        offset += key_lens[i];
+        key_ptrs[i] = PyBytes_AS_STRING(item);
     }
 
     Py_BEGIN_ALLOW_THREADS
@@ -224,19 +218,19 @@ static PyObject *py_query_batch(PyObject *self, PyObject *args) {
 
     PyObject *result = PyList_New(n);
     if (!result) {
-        free(key_data); free(key_ptrs); free(key_lens); free(out_slots);
+        free(key_ptrs); free(key_lens); free(out_slots);
         return NULL;
     }
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *slot_obj = PyLong_FromSize_t(out_slots[i]);
         if (!slot_obj) {
             Py_DECREF(result);
-            free(key_data); free(key_ptrs); free(key_lens); free(out_slots);
+            free(key_ptrs); free(key_lens); free(out_slots);
             return NULL;
         }
         PyList_SET_ITEM(result, i, slot_obj);  /* steals reference */
     }
-    free(key_data); free(key_ptrs); free(key_lens); free(out_slots);
+    free(key_ptrs); free(key_lens); free(out_slots);
     return result;
 }
 

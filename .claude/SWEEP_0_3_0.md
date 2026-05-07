@@ -32,18 +32,46 @@ vs maph's `shock_hash128` (the space champion in maph):
 so `phobic.build(keys, seed=42)` produces byte-identical output regardless
 of CPU count. Below 32K keys: 1 shard. Above: `(N + 15999) / 16000`.
 
-## Notes on the speedup ceiling
+## Notes on the speedup ceiling (and what 0.3.1 fixed)
 
-Parallel build speedup is ~2x even at 12 threads. Profiling suggests the
-remainder is dominated by:
+Initial 0.3.0 parallel build speedup was ~2x even at 12 threads.
+Phase-level profiling (gated on `-DPHOBIC_PROFILE`, results in
+`.claude/PROFILE_0_3_0.md` if rerun) revealed that the C parallel
+section was already fast (520 ms at 12 threads on 10M keys) and the
+real cost was in the Python preamble before any C work began:
 
-- Single-threaded key encoding under the GIL (~500 ms at 10M)
-- malloc/free across many small per-shard buffers (allocator contention)
-- shard distribution pass (single-threaded scan)
+- `[k.encode() if str else bytes(k) for k in keys]`: 1.9 s at 10M.
+  The `bytes(k)` call always copies, even when `k` is already bytes.
+- `len(set(raw)) != len(raw)` uniqueness check: 2.1 s at 10M. Hashes
+  every key into a Python set; for callers that already know their
+  keys are unique (cipher-maps, where keys are HMAC outputs), this
+  is pure waste.
+- A flat-buffer memcpy in `py_build` (160 ms at 10M): defensive copy
+  of every byte before releasing the GIL. Unnecessary because PyBytes
+  is immutable and the keys list reference is held throughout.
 
-All three are 0.4.0 candidates: per-shard arena allocators, parallel
-shard distribution, optional numpy bytes-array input to skip Python-side
-encoding. None are needed to land 0.3.0.
+phobic 0.3.1 fixes all three:
+
+| Config | 0.3.0 | 0.3.1 (default) | 0.3.1 (assume_unique=True) |
+|---|---:|---:|---:|
+| 1 thread | 7762 ms | 6098 ms | 4295 ms |
+| 4 threads | 4230 ms | 2789 ms | 1588 ms |
+| 8 threads | 3822 ms | 2342 ms | 1200 ms |
+| 12 threads | 3712 ms | 2369 ms | **1181 ms** |
+
+**0.3.0 -> 0.3.1 at 12 threads, with `assume_unique=True`: 3.14x faster.**
+
+Parallel scaling within 0.3.1 itself improved as well: from 2x (0.3.0)
+to 2.6x (0.3.1 default) and 3.6x (0.3.1 with `assume_unique=True`),
+because Python-side serial work is no longer the binding constraint.
+
+What's left for 0.4.0:
+
+- Per-thread arena allocator (malloc contention across shard scratch buffers)
+- Parallel shard distribution pass (currently 50 ms single-threaded)
+- numpy bulk-input/bulk-output for batch query (would skip per-key
+  PyBytes/PyLong allocations, possibly 4-5x batch query speedup)
+- SIMD inner loop in `slot_with_pilot` (4-8 keys/cycle with AVX2/AVX-512)
 
 ## Batch query summary
 

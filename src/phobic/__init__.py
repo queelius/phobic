@@ -106,8 +106,14 @@ class PHF:
             return NotImplemented
         return self.to_bytes() == other.to_bytes()
 
-    def __hash__(self):
-        return hash(self.to_bytes())
+    # Not hashable. The previous (0.3.0) implementation was
+    # `hash(self.to_bytes())`, which forced a full re-serialization on every
+    # call (10 MB at 10M keys). Hashing a PHF is rare enough that the cost
+    # is unjustified; explicitly setting __hash__ = None matches the Python
+    # convention for "not naturally hashable" types and prevents accidental
+    # silent O(N) costs in set/dict operations. If a user genuinely needs a
+    # hash, they can call hash(phf.to_bytes()) explicitly.
+    __hash__ = None
 
     def __reduce__(self):
         """Cross-process transport: round-trip via from_bytes."""
@@ -117,7 +123,8 @@ class PHF:
 # ── module-level builders ───────────────────────────────────────────
 
 def build(keys, *, load_factor=0.5, seed=None, num_shards=None,
-          num_threads=None, bucket_size=None, max_retries=100):
+          num_threads=None, bucket_size=None, max_retries=100,
+          assume_unique=False):
     """Build a perfect hash function over *keys*.
 
     Parameters
@@ -130,16 +137,25 @@ def build(keys, *, load_factor=0.5, seed=None, num_shards=None,
     seed : int, optional
         Reproducibility knob. ``None`` uses a random 64-bit seed.
     num_shards : int, optional
-        Number of internal shards. ``None`` picks a data-driven default
-        (1 below ~32K keys; up to ``4 * num_threads`` above).
+        Number of internal shards. ``None`` picks a data-driven default:
+        1 below ~32K keys, ``ceil(N / 16K)`` above. Independent of
+        ``num_threads``, so the same seed yields byte-identical output
+        across machines with different CPU counts.
     num_threads : int, optional
         Worker thread count for parallel build. ``None`` uses CPU count.
-        (Phase 3a is single-threaded; threading lands in 3b.)
     bucket_size : int, optional
         Average keys per bucket per shard. ``None`` picks
         ``ceil(log2(per_shard_N))``.
     max_retries : int, optional
         Per-shard retry budget. Default 100.
+    assume_unique : bool, optional
+        If True, skip the O(N) Python-side uniqueness check. Default False.
+        At 10M keys the uniqueness check is ~2 seconds of single-threaded
+        Python work; for callers that already know their keys are unique
+        (e.g. cipher-maps, where keys are HMAC outputs guaranteed unique
+        by construction) this is pure waste. If True and duplicates are
+        present anyway, the build will fail with a confusing error or
+        produce a non-PHF; that is the caller's responsibility.
 
     Returns
     -------
@@ -178,10 +194,18 @@ def build(keys, *, load_factor=0.5, seed=None, num_shards=None,
         if num_threads_c < 1:
             raise ValueError(f"num_threads must be >= 1 or None, got {num_threads}")
 
-    raw = [k.encode('utf-8') if isinstance(k, str) else bytes(k) for k in keys]
+    # Avoid the redundant `bytes(k)` copy when k is already bytes: it would
+    # allocate a fresh bytes object per key (1.9s at 10M). Use the original
+    # object directly and only copy/encode when the type genuinely needs it.
+    raw = [
+        k if isinstance(k, bytes)
+        else k.encode('utf-8') if isinstance(k, str)
+        else bytes(k)
+        for k in keys
+    ]
     if not raw:
         raise ValueError("keys must be non-empty")
-    if len(set(raw)) != len(raw):
+    if not assume_unique and len(set(raw)) != len(raw):
         raise ValueError("keys must be unique")
 
     handle = _c_build(

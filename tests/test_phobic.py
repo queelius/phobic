@@ -219,6 +219,38 @@ def test_duplicate_keys_rejected():
         phobic.build(["a", "b", "a"])
 
 
+def test_assume_unique_skips_uniqueness_check():
+    """assume_unique=True must NOT raise on a duplicate-key input.
+    The build will fail or produce a non-PHF, but that's the caller's
+    responsibility; phobic just doesn't validate."""
+    keys = [b"a", b"b", b"a"]   # duplicate
+    # We don't assert success here; with duplicates, the build may fail
+    # in the C pilot search. We only assert that the duplicate-detection
+    # error is *not* raised.
+    try:
+        phobic.build(keys, assume_unique=True)
+    except ValueError as e:
+        assert "unique" not in str(e), "assume_unique=True must skip the uniqueness check"
+    except RuntimeError:
+        pass  # the C build can fail; that's acceptable
+
+
+def test_assume_unique_default_still_validates():
+    """Without assume_unique, the duplicate check still fires."""
+    with pytest.raises(ValueError, match="unique"):
+        phobic.build([b"a", b"b", b"a"], assume_unique=False)
+
+
+def test_assume_unique_correctness_on_unique_keys():
+    """assume_unique=True on a genuinely unique key set produces an
+    identical PHF to the default mode (the only difference is whether
+    the uniqueness check is run)."""
+    keys = make_keys(2000)
+    p_default = phobic.build(keys, seed=42).to_bytes()
+    p_assumed = phobic.build(keys, seed=42, assume_unique=True).to_bytes()
+    assert p_default == p_assumed
+
+
 def test_max_retries_below_one_rejected():
     with pytest.raises(ValueError, match="max_retries"):
         phobic.build(["a"], max_retries=0)
@@ -349,6 +381,18 @@ def test_equality_via_bytes():
     c = phobic.build(keys, seed=43)
     assert a == b
     assert not (a == c)
+
+
+def test_phf_is_not_hashable():
+    """PHF is intentionally unhashable: the prior implementation forced
+    a full re-serialization on every call. If a user needs a hash, they
+    can hash phf.to_bytes() explicitly."""
+    keys = make_keys(50)
+    phf = phobic.build(keys, seed=42)
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(phf)
+    with pytest.raises(TypeError, match="unhashable"):
+        {phf}  # set construction calls hash
 
 
 def test_copy_deepcopy():
