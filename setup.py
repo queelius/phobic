@@ -5,7 +5,8 @@ setup(
         Extension(
             "phobic._module",
             sources=["src/phobic/_module.c", "src/phobic/_phobic.c"],
-            extra_compile_args=["-O2", "-std=c11", "-Wall", "-Wextra"],
+            extra_compile_args=["-O2", "-std=c11", "-Wall", "-Wextra", "-pthread"],
+            extra_link_args=["-pthread"],
         ),
     ],
 )

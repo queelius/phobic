@@ -1,319 +1,430 @@
+"""Core API tests for phobic 0.3.0."""
+from __future__ import annotations
+
+import copy
+import random
+
 import phobic
 import pytest
 
 
-def test_build_and_query():
-    keys = [f"key_{i}" for i in range(1000)]
-    phf = phobic.build(keys)
+# ── small helpers ─────────────────────────────────────────────────────
+
+
+def make_keys(n: int, prefix: bytes = b"k_") -> list[bytes]:
+    return [prefix + f"{i:010d}".encode() for i in range(n)]
+
+
+# ── basic build and query ─────────────────────────────────────────────
+
+
+def test_basic_build_and_scalar_query():
+    keys = make_keys(200)
+    phf = phobic.build(keys, seed=0)
     slots = {phf[k] for k in keys}
-    assert len(slots) == 1000
+    assert len(slots) == 200
     assert all(0 <= s < phf.range_size for s in slots)
 
 
-def test_alpha():
-    keys = [f"k{i}" for i in range(100)]
-    phf = phobic.build(keys, alpha=1.2)
-    assert phf.range_size >= 120
-    assert phf.num_keys == 100
+def test_str_keys_auto_encoded():
+    keys = ["alice", "bob", "charlie", "diana"]
+    phf = phobic.build(keys, seed=0)
     slots = {phf[k] for k in keys}
-    assert len(slots) == 100
+    assert len(slots) == len(keys)
 
 
-def test_deterministic():
-    keys = ["a", "b", "c"]
-    phf1 = phobic.build(keys, seed=42)
-    phf2 = phobic.build(keys, seed=42)
-    assert all(phf1[k] == phf2[k] for k in keys)
+def test_str_and_bytes_equivalent_at_same_seed():
+    str_keys = ["a", "b", "c"]
+    byte_keys = [k.encode("utf-8") for k in str_keys]
+    p_str = phobic.build(str_keys, seed=7)
+    p_byt = phobic.build(byte_keys, seed=7)
+    assert p_str.to_bytes() == p_byt.to_bytes()
 
 
-def test_serialization():
-    keys = [f"key_{i}" for i in range(500)]
-    phf = phobic.build(keys)
-    data = phf.to_bytes()
-    phf2 = phobic.from_bytes(data)
-    assert all(phf[k] == phf2[k] for k in keys)
-    assert phf2.num_keys == phf.num_keys
-    assert phf2.range_size == phf.range_size
-
-
-def test_bytes_keys():
-    keys = [b"raw_bytes_0", b"raw_bytes_1", b"raw_bytes_2"]
-    phf = phobic.build(keys)
-    slots = {phf.slot(k) for k in keys}
-    assert len(slots) == 3
-
-
-def test_repr():
-    phf = phobic.build(["a", "b", "c"])
-    r = repr(phf)
-    assert "PHF" in r
-    assert "num_keys=3" in r
-
-
-def test_len():
-    phf = phobic.build(["x", "y", "z"])
-    assert len(phf) == 3
-
-
-def test_bits_per_key():
-    keys = [f"k{i}" for i in range(10000)]
-    phf = phobic.build(keys)
-    assert 0 < phf.bits_per_key < 5.0
-
-
-def test_large_key_set():
-    keys = [f"large_key_{i:08d}" for i in range(100000)]
-    phf = phobic.build(keys)
-    sample = keys[:1000] + keys[-1000:]
-    slots = {phf[k] for k in sample}
-    assert len(slots) == len(sample)
-
-
-def test_lookup_batch_matches_scalar():
-    keys = [f"key_{i}" for i in range(500)]
+def test_batch_lookup_matches_scalar():
+    keys = make_keys(500)
     phf = phobic.build(keys, seed=42)
-    batch = phf.lookup(keys)
-    scalar = [phf[k] for k in keys]
-    assert batch == scalar
+    assert phf.lookup(keys) == [phf[k] for k in keys]
 
 
-def test_lookup_accepts_bytes_and_str():
+def test_lookup_accepts_str_and_bytes_mix():
     phf = phobic.build([b"a", b"b", b"c"], seed=1)
     a = phf.lookup(["a", "b", "c"])
     b = phf.lookup([b"a", b"b", b"c"])
     assert a == b
 
 
-def test_partitioned_lookup_matches_scalar():
-    keys = [f"k{i}".encode() for i in range(1000)]
-    phf = phobic.build_partitioned(keys, num_shards=8, shard_seed=42)
-    batch = phf.lookup(keys)
-    scalar = [phf[k] for k in keys]
-    assert batch == scalar
+def test_lookup_num_threads_does_not_change_results():
+    keys = make_keys(20_000)
+    phf = phobic.build(keys, seed=0, num_shards=8, num_threads=8)
+    assert phf.lookup(keys, num_threads=1) == phf.lookup(keys, num_threads=8)
 
 
-def test_empty_keys_raises():
+# ── load_factor semantics ─────────────────────────────────────────────
+
+
+def test_load_factor_default_is_0_5():
+    keys = make_keys(1000)
+    phf = phobic.build(keys, seed=0)
+    # range_size = ceil(num_keys / load_factor) per shard, summed.
+    # At default load_factor=0.5 with single-shard, range_size == 2 * N.
+    # For multi-shard the per-shard range may have rounding, so allow a
+    # tiny slack at the per-shard level.
+    assert 0.45 <= len(phf) / phf.range_size <= 0.55
+
+
+def test_load_factor_extremes():
+    keys = make_keys(200)
+    loose = phobic.build(keys, load_factor=0.1, seed=5)
+    tight = phobic.build(keys, load_factor=0.95, seed=5)
+    # loose has more headroom -> bigger range
+    assert loose.range_size > tight.range_size
+
+
+def test_load_factor_zero_rejected():
+    with pytest.raises(ValueError, match="load_factor"):
+        phobic.build(["a", "b"], load_factor=0.0)
+
+
+def test_load_factor_above_one_rejected():
+    with pytest.raises(ValueError, match="load_factor"):
+        phobic.build(["a", "b"], load_factor=1.1)
+
+
+def test_load_factor_negative_rejected():
+    with pytest.raises(ValueError, match="load_factor"):
+        phobic.build(["a", "b"], load_factor=-0.5)
+
+
+def test_load_factor_one_mphf_at_easy_n():
+    """load_factor=1.0 (MPHF) is hardest to build but should succeed for
+    small N with enough retries."""
+    keys = make_keys(50)
+    phf = phobic.build(keys, load_factor=1.0, seed=0, max_retries=200)
+    assert phf.range_size == 50  # exactly minimal
+
+
+# ── num_shards ────────────────────────────────────────────────────────
+
+
+def test_num_shards_explicit():
+    keys = make_keys(2000)
+    phf = phobic.build(keys, num_shards=8, seed=0)
+    assert phf.num_shards == 8
+
+
+def test_num_shards_auto_small_n_is_one():
+    """Below ~32K keys, auto picks single shard."""
+    keys = make_keys(1000)
+    phf = phobic.build(keys, seed=0)
+    assert phf.num_shards == 1
+
+
+def test_num_shards_auto_large_n_is_multi():
+    """Above ~32K keys, auto picks multiple shards."""
+    keys = make_keys(50_000)
+    phf = phobic.build(keys, seed=0)
+    assert phf.num_shards > 1
+
+
+def test_num_shards_zero_rejected():
+    with pytest.raises(ValueError, match="num_shards"):
+        phobic.build(["a"], num_shards=0)
+
+
+def test_num_shards_one_is_legal():
+    keys = make_keys(100)
+    phf = phobic.build(keys, num_shards=1, seed=0)
+    assert phf.num_shards == 1
+    slots = {phf[k] for k in keys}
+    assert len(slots) == len(keys)
+
+
+# ── num_threads ───────────────────────────────────────────────────────
+
+
+def test_num_threads_does_not_affect_output():
+    keys = make_keys(20_000)
+    p1 = phobic.build(keys, seed=42, num_shards=8, num_threads=1).to_bytes()
+    p4 = phobic.build(keys, seed=42, num_shards=8, num_threads=4).to_bytes()
+    p8 = phobic.build(keys, seed=42, num_shards=8, num_threads=8).to_bytes()
+    assert p1 == p4 == p8
+
+
+def test_auto_num_shards_thread_independent():
+    """The auto-shard heuristic must be a pure function of N, not of
+    num_threads. Otherwise the same `phobic.build(keys, seed=...)` call
+    produces different output on machines with different CPU counts:
+    a real cross-machine reproducibility hazard."""
+    keys = make_keys(100_000)
+    p1 = phobic.build(keys, seed=42, num_threads=1)
+    p4 = phobic.build(keys, seed=42, num_threads=4)
+    p12 = phobic.build(keys, seed=42, num_threads=12)
+    assert p1.num_shards == p4.num_shards == p12.num_shards
+    assert p1.to_bytes() == p4.to_bytes() == p12.to_bytes()
+
+
+def test_num_threads_zero_rejected():
+    with pytest.raises(ValueError, match="num_threads"):
+        phobic.build(["a"], num_threads=0)
+
+
+# ── bucket_size ───────────────────────────────────────────────────────
+
+
+def test_bucket_size_explicit_small_builds():
+    keys = make_keys(2000)
+    phf = phobic.build(keys, bucket_size=4, seed=0)
+    slots = {phf[k] for k in keys}
+    assert len(slots) == len(keys)
+
+
+def test_bucket_size_zero_rejected():
+    with pytest.raises(ValueError, match="bucket_size"):
+        phobic.build(["a"], bucket_size=0)
+
+
+# ── seed semantics ────────────────────────────────────────────────────
+
+
+def test_same_seed_byte_identical_output():
+    keys = make_keys(500)
+    a = phobic.build(keys, seed=12345, num_shards=4)
+    b = phobic.build(keys, seed=12345, num_shards=4)
+    assert a.to_bytes() == b.to_bytes()
+
+
+def test_different_seeds_differ():
+    keys = make_keys(500)
+    a = phobic.build(keys, seed=1, num_shards=4)
+    b = phobic.build(keys, seed=2, num_shards=4)
+    assert a.to_bytes() != b.to_bytes()
+
+
+def test_seed_out_of_range_rejected():
+    with pytest.raises(ValueError, match="seed"):
+        phobic.build(["a", "b"], seed=2**64)
+
+
+# ── input validation ──────────────────────────────────────────────────
+
+
+def test_empty_keys_rejected():
     with pytest.raises((ValueError, RuntimeError)):
         phobic.build([])
 
 
-def test_from_bytes_module_level():
-    keys = ["a", "b", "c"]
-    phf = phobic.build(keys)
-    data = phf.to_bytes()
-    phf2 = phobic.from_bytes(data)
-    assert all(phf[k] == phf2[k] for k in keys)
-
-
-def test_duplicate_keys_raises():
-    with pytest.raises((ValueError, RuntimeError)):
+def test_duplicate_keys_rejected():
+    with pytest.raises(ValueError, match="unique"):
         phobic.build(["a", "b", "a"])
 
 
-def test_from_bytes_truncated_raises():
-    phf = phobic.build(["x", "y", "z"])
-    data = phf.to_bytes()
-    with pytest.raises((ValueError, RuntimeError)):
-        phobic.from_bytes(data[:10])
+def test_max_retries_below_one_rejected():
+    with pytest.raises(ValueError, match="max_retries"):
+        phobic.build(["a"], max_retries=0)
 
 
-def test_from_bytes_corrupted_magic_raises():
-    phf = phobic.build(["x", "y", "z"])
-    data = bytearray(phf.to_bytes())
-    data[0] ^= 0xFF  # corrupt magic byte
-    with pytest.raises((ValueError, RuntimeError)):
-        phobic.from_bytes(bytes(data))
+def test_max_retries_one_succeeds_for_easy_build():
+    """Single attempt should be enough for an obviously easy build."""
+    keys = make_keys(100)
+    phf = phobic.build(keys, max_retries=1, seed=0, load_factor=0.25)
+    assert len(phf) == 100
 
 
-def test_seed_out_of_range_raises():
-    with pytest.raises(ValueError):
-        phobic.build(["a", "b"], seed=2**64)
+# ── build-failure error message ───────────────────────────────────────
 
 
-def test_negative_alpha_raises():
-    with pytest.raises(ValueError):
-        phobic.build(["a", "b"], alpha=-0.5)
+def test_build_failure_message_mentions_diagnostics():
+    """Asking for an unrealistic build (MPHF with one retry on a tough seed)
+    should fail with a message containing useful tuning hints."""
+    keys = make_keys(5000)
+    with pytest.raises(RuntimeError) as exc:
+        phobic.build(keys, load_factor=1.0, seed=0, max_retries=1, num_shards=1,
+                     bucket_size=20)
+    msg = str(exc.value)
+    assert "PHOBIC" in msg
+    assert "load_factor" in msg or "shard" in msg
 
 
-def test_perfect_build_is_perfect():
-    keys = [f"key_{i}" for i in range(500)]
-    phf = phobic.build(keys)
-    assert phf.is_perfect
-    assert phf.collisions == 0
+# ── introspection ─────────────────────────────────────────────────────
 
 
-def test_strict_false_returns_result():
-    """Non-strict mode should always return a PHF (never raise on failure)."""
-    keys = [f"k{i}" for i in range(200)]
-    phf = phobic.build(keys, strict=False, max_retries=5)
-    assert phf is not None
-    assert len(phf) == 200
+def test_len_returns_num_keys():
+    keys = make_keys(123)
+    phf = phobic.build(keys, seed=0)
+    assert len(phf) == 123
 
 
-def test_strict_false_perfect_when_easy():
-    """Non-strict with plenty of headroom should still find a perfect PHF."""
-    keys = [f"key_{i}" for i in range(100)]
-    phf = phobic.build(keys, alpha=1.0, strict=False, max_retries=50)
-    assert phf.is_perfect
+def test_repr_includes_key_metrics():
+    keys = make_keys(50)
+    phf = phobic.build(keys, seed=0)
+    r = repr(phf)
+    assert "PHF" in r
+    assert "num_keys=50" in r
+    assert "num_shards=" in r
+    assert "bits_per_key=" in r
 
 
-def test_strict_false_collision_count_type():
-    """PHF.collisions must be a non-negative integer."""
-    keys = [f"x{i}" for i in range(50)]
-    phf = phobic.build(keys, strict=False, max_retries=10)
-    assert isinstance(phf.collisions, int)
-    assert phf.collisions >= 0
+def test_bits_per_key_is_positive():
+    keys = make_keys(10_000)
+    phf = phobic.build(keys, seed=0)
+    assert phf.bits_per_key > 0
+    assert phf.bits_per_key < 50  # sanity
 
 
-def test_max_retries_param():
-    """max_retries=1 should succeed for an easy build."""
-    keys = [f"k{i}" for i in range(50)]
-    phf = phobic.build(keys, alpha=1.0, max_retries=1, seed=0)
-    assert phf.is_perfect
+def test_range_size_matches_to_bytes():
+    """range_size should match what serialize/deserialize report."""
+    keys = make_keys(200)
+    phf = phobic.build(keys, seed=0)
+    blob = phf.to_bytes()
+    phf2 = phobic.from_bytes(blob)
+    assert phf.range_size == phf2.range_size
+    assert phf.num_shards == phf2.num_shards
+    assert len(phf) == len(phf2)
 
 
-def test_repr_includes_collisions_when_nonzero():
-    """repr should mention collisions only when > 0."""
-    keys = [f"k{i}" for i in range(50)]
-    phf = phobic.build(keys, alpha=1.0)
-    assert "collisions" not in repr(phf)
+# ── serialization (wire format v3) ────────────────────────────────────
 
 
-def test_serialization_preserves_collisions():
-    """Round-trip serialization must preserve collisions field."""
-    keys = [f"key_{i}" for i in range(200)]
-    phf = phobic.build(keys, strict=False, max_retries=50)
-    data = phf.to_bytes()
-    phf2 = phobic.from_bytes(data)
-    assert phf2.collisions == phf.collisions
-    assert phf2.is_perfect == phf.is_perfect
-
-
-def test_build_with_slots_returns_pair():
-    keys = [f"k{i}" for i in range(100)]
-    result = phobic.build_with_slots(keys, seed=0)
-    assert isinstance(result, tuple) and len(result) == 2
-    phf, slots = result
-    assert isinstance(phf, phobic.PHF)
-    assert isinstance(slots, list)
-    assert len(slots) == len(keys)
-
-
-def test_build_with_slots_matches_scalar():
-    keys = [f"key_{i}" for i in range(500)]
-    phf, slots = phobic.build_with_slots(keys, seed=42)
-    assert slots == [phf[k] for k in keys]
-
-
-def test_build_with_slots_bytes_keys():
-    keys = [f"k{i}".encode() for i in range(200)]
-    phf, slots = phobic.build_with_slots(keys, seed=0)
-    assert slots == [phf[k] for k in keys]
-    assert len(set(slots)) == len(slots)
-
-
-def test_build_with_slots_str_bytes_equivalence():
-    """str keys are encoded as UTF-8, so they should yield the same slots
-    as the equivalent bytes keys at the same seed."""
-    str_keys = ["alpha", "beta", "gamma"]
-    byte_keys = [k.encode("utf-8") for k in str_keys]
-    _, slots_str = phobic.build_with_slots(str_keys, seed=7)
-    _, slots_bytes = phobic.build_with_slots(byte_keys, seed=7)
-    assert slots_str == slots_bytes
-
-
-def test_build_with_slots_empty_raises():
-    with pytest.raises((ValueError, RuntimeError)):
-        phobic.build_with_slots([])
-
-
-def test_build_with_slots_duplicate_raises():
-    with pytest.raises((ValueError, RuntimeError)):
-        phobic.build_with_slots(["a", "b", "a"])
-
-
-def test_build_with_slots_negative_alpha_raises():
-    with pytest.raises(ValueError):
-        phobic.build_with_slots(["a", "b"], alpha=-0.1)
-
-
-def test_build_with_slots_seed_out_of_range_raises():
-    with pytest.raises(ValueError):
-        phobic.build_with_slots(["a", "b"], seed=2**64)
-
-
-def test_build_with_slots_strict_false_consistent():
-    """With strict=False the build may produce collisions, but the slot
-    list must still agree with scalar queries on the returned PHF.
-    Slots are unique iff phf.is_perfect."""
-    keys = [f"k{i}" for i in range(200)]
-    phf, slots = phobic.build_with_slots(keys, strict=False, max_retries=5)
-    assert slots == [phf[k] for k in keys]
-    assert (len(set(slots)) == len(slots)) == phf.is_perfect
-
-
-# ── bucket_size parameter ──────────────────────────────────────────────
-
-
-def test_bucket_size_explicit_small_builds():
-    """Small fixed buckets always build at any reasonable N."""
-    keys = [f"k{i}" for i in range(1000)]
-    phf = phobic.build(keys, bucket_size=4, seed=0)
-    slots = {phf[k] for k in keys}
-    assert len(slots) == 1000
-
-
-def test_bucket_size_default_matches_none():
-    """Passing bucket_size=None must behave identically to the default."""
-    keys = [f"k{i}" for i in range(200)]
-    phf_none = phobic.build(keys, seed=42)
-    phf_default = phobic.build(keys, bucket_size=None, seed=42)
-    assert all(phf_none[k] == phf_default[k] for k in keys)
-
-
-def test_bucket_size_changes_mapping():
-    """Different bucket_size values (with the same seed) must produce
-    different slot assignments. The mapping depends on num_buckets,
-    which depends on bucket_size."""
-    keys = [f"k{i}" for i in range(200)]
-    phf4 = phobic.build(keys, bucket_size=4, seed=0)
-    phf8 = phobic.build(keys, bucket_size=8, seed=0)
-    differing = sum(1 for k in keys if phf4[k] != phf8[k])
-    assert differing > 0
-
-
-def test_bucket_size_smaller_uses_more_bits_per_key():
-    """Smaller buckets have less pilot amortization, so bits/key rises."""
-    keys = [f"k{i}" for i in range(10000)]
-    bpk_small = phobic.build(keys, bucket_size=2, seed=1).bits_per_key
-    bpk_large = phobic.build(keys, bucket_size=10, seed=1).bits_per_key
-    assert bpk_small > bpk_large
-
-
-def test_bucket_size_zero_raises():
-    """bucket_size=0 is reserved as the C-side auto sentinel; Python rejects it."""
-    with pytest.raises(ValueError):
-        phobic.build(["a", "b"], bucket_size=0)
-
-
-def test_bucket_size_negative_raises():
-    with pytest.raises(ValueError):
-        phobic.build(["a", "b"], bucket_size=-1)
-
-
-def test_bucket_size_serialization_roundtrip():
-    """Serialized PHF must round-trip the bucket_size invisibly: queries
-    on the deserialized PHF must match the original."""
-    keys = [f"k{i}" for i in range(500)]
-    phf = phobic.build(keys, bucket_size=4, seed=7)
+def test_serialization_round_trip_single_shard():
+    keys = make_keys(100)
+    phf = phobic.build(keys, num_shards=1, seed=42)
     phf2 = phobic.from_bytes(phf.to_bytes())
-    assert all(phf[k] == phf2[k] for k in keys)
-    assert phf2.range_size == phf.range_size
+    for k in keys:
+        assert phf[k] == phf2[k]
 
 
-def test_bucket_size_flows_through_build_with_slots():
-    """build_with_slots must accept and honour bucket_size."""
-    keys = [f"k{i}" for i in range(300)]
-    phf, slots = phobic.build_with_slots(keys, bucket_size=4, seed=3)
-    assert slots == [phf[k] for k in keys]
-    assert len(set(slots)) == len(slots)
+def test_serialization_round_trip_multi_shard():
+    keys = make_keys(5000)
+    phf = phobic.build(keys, num_shards=8, seed=42)
+    phf2 = phobic.from_bytes(phf.to_bytes())
+    for k in keys:
+        assert phf[k] == phf2[k]
+
+
+def test_wire_magic_is_phf3():
+    """Wire format v3 magic on the wire is b'PHF3'."""
+    phf = phobic.build([b"x"], seed=0)
+    assert phf.to_bytes()[:4] == b"PHF3"
+
+
+def test_wire_format_rejects_unknown_magic():
+    with pytest.raises(ValueError):
+        phobic.from_bytes(b"XXXX" + b"\x00" * 100)
+
+
+def test_wire_format_rejects_truncated():
+    phf = phobic.build([b"x", b"y", b"z"], seed=0)
+    blob = phf.to_bytes()
+    with pytest.raises(ValueError):
+        phobic.from_bytes(blob[:8])
+
+
+def test_wire_format_rejects_old_v2_phob():
+    """0.2.0 'BOHP' magic is not readable by 0.3.0 (clean break)."""
+    with pytest.raises(ValueError):
+        phobic.from_bytes(b"BOHP" + b"\x02\x00\x00\x00" + b"\x00" * 100)
+
+
+def test_pilots_offset_is_8_byte_aligned():
+    """The wire format guarantees pilot blocks start on 8-byte boundaries
+    (mmap-friendly). Decode the descriptor table and verify."""
+    import struct
+    keys = make_keys(500)
+    phf = phobic.build(keys, num_shards=4, seed=0)
+    blob = phf.to_bytes()
+    num_shards = struct.unpack_from("<Q", blob, 24)[0]
+    for s in range(num_shards):
+        pilots_off = struct.unpack_from("<Q", blob, 56 + 40 * s + 32)[0]
+        assert pilots_off % 8 == 0, f"shard {s} pilots_offset={pilots_off} not 8-byte aligned"
+
+
+# ── equality, copy, cross-process protocol ───────────────────────────
+
+
+def test_equality_via_bytes():
+    keys = make_keys(50)
+    a = phobic.build(keys, seed=42)
+    b = phobic.build(keys, seed=42)
+    c = phobic.build(keys, seed=43)
+    assert a == b
+    assert not (a == c)
+
+
+def test_copy_deepcopy():
+    keys = make_keys(50)
+    phf = phobic.build(keys, seed=42)
+    phf2 = copy.deepcopy(phf)
+    assert phf == phf2
+    for k in keys:
+        assert phf[k] == phf2[k]
+
+
+def test_reduce_protocol_round_trip():
+    """__reduce__ is the protocol used by copy/deepcopy and cross-process
+    transport (multiprocessing.Pool worker hand-off)."""
+    keys = make_keys(50)
+    phf = phobic.build(keys, seed=42)
+    factory, args = phf.__reduce__()
+    restored = factory(*args)
+    assert restored == phf
+    for k in keys:
+        assert phf[k] == restored[k]
+
+
+# ── from_bytes accepts bytes-like ─────────────────────────────────────
+
+
+def test_from_bytes_accepts_bytearray():
+    phf = phobic.build([b"a", b"b", b"c"], seed=0)
+    blob = phf.to_bytes()
+    phf2 = phobic.from_bytes(bytearray(blob))
+    assert phf == phf2
+
+
+def test_from_bytes_accepts_memoryview():
+    phf = phobic.build([b"a", b"b", b"c"], seed=0)
+    blob = phf.to_bytes()
+    phf2 = phobic.from_bytes(memoryview(blob))
+    assert phf == phf2
+
+
+# ── distribution robustness ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("gen", [
+    pytest.param(lambda n: [bytes(random.Random(i).randbytes(16)) for i in range(n)],
+                 id="random_bytes_16"),
+    pytest.param(lambda n: [f"{i:010d}".encode() for i in range(n)],
+                 id="sequential_int"),
+    pytest.param(lambda n: [f"https://example.com/path/{i}".encode() for i in range(n)],
+                 id="url_like"),
+    pytest.param(lambda n: [(b"x" * (i % 32)) + str(i).encode() for i in range(n)],
+                 id="variable_length"),
+])
+def test_builds_across_distributions(gen):
+    keys = gen(10_000)
+    keys = list(dict.fromkeys(keys))  # drop accidental duplicates
+    phf = phobic.build(keys, seed=0)
+    slots = {phf[k] for k in keys[:500]}
+    assert len(slots) == 500
+
+
+# ── parallel batch query thread safety ────────────────────────────────
+
+
+def test_concurrent_lookups_are_consistent():
+    """The same PHF queried concurrently from multiple threads must yield
+    the same per-key answers (PHF is read-only after construction)."""
+    import threading
+    keys = make_keys(2000)
+    phf = phobic.build(keys, seed=0)
+    expected = phf.lookup(keys, num_threads=1)
+    results = [None] * 4
+    def worker(idx):
+        results[idx] = phf.lookup(keys, num_threads=2)
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    for r in results:
+        assert r == expected

@@ -1,10 +1,8 @@
 # phobic
 
-Fast minimal perfect hash functions for Python.
+**Minimal-ish perfect hash functions for very large key sets, with a parameterised load factor.**
 
-A **perfect hash function** maps a known set of *n* keys to distinct integers in [0, *m*) with no collisions. Build it once from your key set, then every lookup is O(1). Implemented in C11 with no runtime dependencies.
-
-## Install
+A perfect hash function maps a known set of *n* keys to distinct integers in `[0, m)` with no collisions. Build it once from your key set, then every lookup is O(1). phobic builds in parallel C, queries in parallel C, and serialises to a portable wire format.
 
 ```
 pip install phobic
@@ -15,115 +13,108 @@ pip install phobic
 ```python
 import phobic
 
-# Build a perfect hash function
-keys = ["alice", "bob", "charlie", "diana"]
+# Build
+keys = [f"key_{i}".encode() for i in range(1_000_000)]
 phf = phobic.build(keys)
 
-# Query: returns a unique integer per key
-phf["alice"]    # e.g., 2
-phf["bob"]      # e.g., 0
+# Query
+phf[b"key_42"]                  # scalar -> int slot
+phf.lookup(keys[:100])          # batch -> list[int] (parallel C above ~1K keys)
 
-# Properties
-phf.num_keys      # 4
-phf.range_size    # 8 (with default alpha=1.0)
-phf.bits_per_key  # ~1.0
-phf.collisions    # 0
-phf.is_perfect    # True
-
-# Persistence
+# Persist (wire format v3, mmap-friendly layout)
 data = phf.to_bytes()
 phf2 = phobic.from_bytes(data)
+assert phf == phf2
+
+# Inspect
+len(phf)             # number of keys
+phf.range_size       # output range, [0, range_size)
+phf.num_shards       # internal sharding (1 at small N, more at scale)
+phf.bits_per_key     # serialised size in bits, divided by num_keys
 ```
 
-### Build with slot map
-
-When you'll immediately fill a slot array indexed by `phf[k]` for every key (a common pattern in PHF-backed retrieval and cipher-map structures), `build_with_slots` returns the slot list as a build by-product, saving a redundant pass:
+## Knobs
 
 ```python
-phf, slots = phobic.build_with_slots(keys)
-# slots[i] == phf[keys[i]] for every i
-table = [None] * phf.range_size
-for i, s in enumerate(slots):
-    table[s] = values[i]
+phf = phobic.build(
+    keys,
+    load_factor=0.5,    # num_keys / range_size, in (0, 1]. 1.0 = MPHF.
+    seed=None,          # one knob; reproducible builds
+    num_shards=None,    # None = auto (1 below ~32K keys; scales above)
+    num_threads=None,   # None = auto (CPU count)
+    bucket_size=None,   # None = ceil(log2(per_shard_N))
+    max_retries=100,    # per-shard retry budget on the pilot search
+)
 ```
 
-### Options
+### `load_factor` (the central trade-off)
 
-```python
-# Closer to minimal: 5% overhead instead of 100% (slower build, may need more retries)
-phf = phobic.build(keys, alpha=0.05)
+`load_factor` is the canonical hash-table sense: keys per slot, in `(0, 1]`.
 
-# Fixed seed for reproducibility
-phf = phobic.build(keys, seed=42)
+| `load_factor` | meaning | build cost | space |
+|---|---|---|---|
+| `0.1` | very loose, ~10x range | trivial | wasteful |
+| `0.5` (default) | 2x range | fast | moderate |
+| `0.95` | nearly minimal | slow | tight |
+| `1.0` | MPHF (range == num_keys) | hardest | optimal |
 
-# Control retry budget (default 100)
-phf = phobic.build(keys, max_retries=200)
+If a build can't find a perfect hash within `max_retries`, phobic raises a `RuntimeError` that *names the failing shard* and *suggests how to relax the constraints*.
 
-# Average keys per bucket. None (default) picks ceil(log2 N), which
-# minimises bits/key. Smaller values (e.g. 8) build dramatically
-# faster at large N, at the cost of ~2x bits/key. At N=100K keys,
-# bucket_size=8 is ~6x faster than the default for cipher-maps-style
-# workloads. See .claude/SWEEP_BUCKET_SIZE.md for the full sweep.
-phf = phobic.build(keys, bucket_size=8)
-```
+### Parallelism
 
-### Non-perfect builds
+Both the build and `lookup()` release the GIL and fan out across pthreads:
 
-By default, `build()` raises `RuntimeError` if no perfect hash is found within the retry budget. With `strict=False`, it always returns the best result found:
+- **Build** parallelism is per-shard. At `num_shards=1` the build is single-threaded; above that it scales nearly linearly to `num_threads`.
+- **Batch query** is chunked across `num_threads` above an internal threshold (~1024 keys). Below the threshold the call is serial.
 
-```python
-phf = phobic.build(keys, alpha=0.05, strict=False)
-phf.is_perfect   # False if no perfect build was found
-phf.collisions   # number of keys placed in already-occupied slots
-```
-
-The builder tries multiple seeds and gradually widens `alpha` across retries, keeping the attempt with the fewest collisions.
-
-## Space Efficiency
-
-PHOBIC achieves ~1 bit/key for the hash structure at 100k keys. When used as a filter (PHF + n-bit fingerprints), total space is `bpk + log2(1/e)` bits/key for false positive rate `e`. This beats Bloom filters (`1.44 * log2(1/e)`) whenever `e` is small enough that the PHF overhead is absorbed.
+Determinism is preserved: same `seed` and same `num_shards` produce byte-identical `to_bytes()` regardless of `num_threads`.
 
 ## Performance
 
-C11 core, single-threaded. The GIL is released during construction so other Python threads can run concurrently. Typical build times: ~0.5 us/key at n=1k, ~1.8 us/key at n=100k. Query throughput: ~2M queries/sec from Python (~500 ns/query including str-to-bytes encoding).
+Measured on a 12-core machine, default `load_factor=0.5`, 16-byte uniform keys (cipher-maps shape):
 
-## Scale: partitioned builds
+| N | num_shards | bpk | build @ 1 thread | build @ 12 threads | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1K | 1 | 2.37 | <1 ms | <1 ms | (tiny) |
+| 100K | 7 | 1.17 | 57 ms | 26 ms | 2.2x |
+| 1M | 63 | 1.17 | 636 ms | 306 ms | 2.1x |
+| 10M | 625 | 1.16 | 7.42 s | 3.72 s | 2.0x |
 
-For n above ~500K, single-threaded pilot search becomes the bottleneck; at n=1M the default parameters take ~100 s and above ~2M the build can fail entirely. Use `build_partitioned` to shard across cores:
+vs phobic 0.2.0: 1M parallel went from 2.0 s to 0.34 s (5.9x), and 10M from "would not finish" serially to 7.4 s serial / 3.7 s parallel.
 
-```python
-import phobic
+vs maph's `partitioned_phf<phobic4>` (the reference in the sibling research repo): at 10M, phobic 0.3.0 is 2x faster and uses 2.4x fewer bits per key. See `.claude/SWEEP_0_3_0.md` for the full sweep.
 
-keys = [f"key_{i}".encode() for i in range(10_000_000)]
+## Wire format
 
-# Uses ThreadPoolExecutor + the GIL-releasing C build to parallelize.
-phf = phobic.build_partitioned(keys)
+`phf.to_bytes()` produces a versioned, mmap-friendly v3 blob (magic `b"PHF3"`):
 
-phf.num_keys      # 10_000_000
-phf.num_shards    # 666 (auto: 15K keys per shard)
-phf.bits_per_key  # ~1.18 (per-shard headers + partition wrapper)
-phf[b"key_42"]    # unique slot in [0, phf.range_size)
-
-# Wire-serializable with its own magic bytes.
-data = phf.to_bytes()
-phf2 = phobic.PartitionedPHF.from_bytes(data)
+```
+56 bytes  global header   (num_keys, total_range, num_shards, seed, shard_seed)
+40 bytes  per shard       (descriptor table, fixed-size, indexable)
+variable  per shard       (uint16 pilot blocks, 8-byte aligned)
 ```
 
-Measured speedup (8-core machine):
+Fixed-size descriptor table + absolute pilot offsets means a future `phobic.from_file(path)` can mmap the blob directly without parsing variable-size sections. (Not in 0.3.0; the format pre-pays for it.)
 
-| n | serial | partitioned | speedup |
-|---:|-------:|-----------:|--------:|
-| 100K | 0.10 s | 0.18 s | 0.6x (threading overhead wins at small n) |
-| 500K | 1.08 s | 0.94 s | 1.2x |
-| 1M | 133.5 s | 2.0 s | **67.7x** |
-| 2M | fails | 4.0 s | serial unbuildable |
-| 10M | - | 20.6 s | - |
+## Cross-process transport
 
-At small `n` the per-shard metadata makes partitioning slightly slower. From roughly 500K up it wins decisively; at 1M+ it is often the only way to build at all. See [`src/phobic/partitioned.py`](src/phobic/partitioned.py) for the implementation.
+`PHF` instances support equality (`==`), `copy.deepcopy`, and the `__reduce__` protocol used by `multiprocessing.Pool`:
 
-## Demo
+```python
+import multiprocessing as mp
 
-See [`demo.ipynb`](demo.ipynb) for an interactive walkthrough covering the API, alpha trade-offs, space efficiency, serialization, and a matplotlib plot of how collisions decrease with retry budget.
+phf = phobic.build(keys)
+with mp.Pool(8) as p:
+    p.map(worker_using_phf, work_items)   # phf serialises through to_bytes / from_bytes
+```
+
+## What phobic explicitly is not
+
+phobic is a pure PHF builder. The following live elsewhere:
+
+- **Membership testing / Bloom filters / fingerprinting**: out of scope. Phobic does not promise that a key not in the build set will be detected; it returns an arbitrary slot for unknown keys. See `maph` for membership oracles.
+- **Value retrieval / Bloomier maps / cipher maps**: out of scope. Build an external value array indexed by `phf[key]`.
+- **Approximate / non-perfect modes**: a `PHF` is always perfect. Build failure raises with a diagnostic; non-perfect output is a category error.
 
 ## License
 
