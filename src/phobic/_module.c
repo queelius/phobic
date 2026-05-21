@@ -138,7 +138,7 @@ static PyObject *py_build(PyObject *self, PyObject *args) {
                 "load_factor=%.4f, bucket_size=%zu). "
                 "Try lower load_factor, more shards, or higher max_retries.",
                 diag.failed_shard,
-                max_retries > 0 ? max_retries : 100,
+                max_retries,
                 diag.best_collisions,
                 diag.resolved_load_factor,
                 diag.resolved_bucket_size);

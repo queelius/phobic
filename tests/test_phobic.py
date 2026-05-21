@@ -472,3 +472,66 @@ def test_concurrent_lookups_are_consistent():
     for t in ts: t.join()
     for r in results:
         assert r == expected
+
+
+# ── regression: deserialize hardening & empty-shard query ─────────────
+
+
+def test_wire_format_rejects_overflowing_pilot_offset():
+    """A crafted pilots_offset near UINT64_MAX must not slip past the
+    deserializer's bounds check by integer overflow (s_poff + pilot_bytes
+    wrapping past 2**64). Regression for an OOB read in phobic_deserialize."""
+    import struct
+    phf = phobic.build(make_keys(100), num_shards=1, seed=0)
+    blob = bytearray(phf.to_bytes())
+    num_buckets = struct.unpack_from("<Q", blob, 56 + 16)[0]
+    assert num_buckets >= 4  # need pilot_bytes >= 8 so the offset can wrap
+    # pilots_offset is the 5th u64 of shard descriptor 0 (descriptor at 56).
+    struct.pack_into("<Q", blob, 56 + 32, (1 << 64) - 8)
+    with pytest.raises(ValueError):
+        phobic.from_bytes(bytes(blob))
+
+
+def test_query_on_empty_shard_does_not_crash():
+    """A PHF built with more shards than keys has empty shards. Querying a
+    key not in the build set may hash to an empty shard; that must return a
+    valid slot, not crash (SIGFPE / NULL deref). Runs in a subprocess
+    because the pre-fix bug aborts the interpreter."""
+    import subprocess
+    import sys
+    code = (
+        "import phobic\n"
+        "phf = phobic.build([b'a', b'b'], num_shards=64, seed=0)\n"
+        "for i in range(200):\n"
+        "    s = phf[b'miss-%d' % i]\n"
+        "    assert 0 <= s < phf.range_size, s\n"
+        "print('OK')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, (
+        f"empty-shard query crashed: rc={r.returncode} "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+    assert "OK" in r.stdout
+
+
+def test_lookup_default_threads_matches_scalar_large_batch():
+    """lookup() with default num_threads auto-parallelises above the internal
+    threading threshold; the parallel path must agree with scalar queries."""
+    keys = make_keys(5000)  # well above the 1024-key threading threshold
+    phf = phobic.build(keys, seed=7)
+    assert phf.lookup(keys) == [phf[k] for k in keys]
+
+
+def test_build_and_lookup_accept_bytes_subclass():
+    """A bytes subclass works as a key through both build() and lookup():
+    the shared key-encoding helper passes such instances straight to C."""
+    class MyKey(bytes):
+        pass
+    keys = [MyKey(f"k{i}".encode()) for i in range(50)]
+    phf = phobic.build(keys, seed=0)
+    assert phf.lookup(keys) == [phf[k] for k in keys]
+    plain = [bytes(k) for k in keys]
+    assert phf.lookup(plain) == phf.lookup(keys)
+    assert phf.to_bytes() == phobic.build(plain, seed=0).to_bytes()

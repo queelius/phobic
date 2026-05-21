@@ -52,9 +52,10 @@ typedef struct {
  * Caller allocates and zeros before the call. Untouched on success.
  *
  * failed_shard:           -1 if the failure was non-shard (e.g. OOM, invalid input)
- * best_collisions:        smallest collision count seen across all retry attempts
- *                         on the failing shard (useful for "you needed N more retries
- *                         or a lower load_factor")
+ * best_collisions:        across all retry attempts on the failing shard, the
+ *                         smallest "first unplaceable bucket size" seen. A
+ *                         rough proxy for how close the build got; tune with
+ *                         more retries or a lower load_factor.
  * resolved_load_factor:   what the per-shard build was actually using (may have
  *                         drifted from opts->load_factor due to retry bumps)
  * resolved_bucket_size:   what the per-shard build was actually using
@@ -79,12 +80,13 @@ phobic_phf *phobic_build(const char **keys,
                           size_t num_keys,
                           const phobic_build_opts *opts);
 
-/* Scalar query. Caller must guarantee phf was built and key_len > 0. */
+/* Scalar query. Caller must guarantee phf was built. key_len may be 0. */
 size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len);
 
 /* Batch query. out_slots must hold at least n size_t.
- * num_threads <= 1: serial fast path (the only one in 0.3.0 phase 3a).
- * num_threads > 1:  pthread fan-out (added in phase 3b).
+ * num_threads <= 0: auto (online CPU count).
+ * num_threads == 1: serial.
+ * num_threads > 1:  pthread fan-out, above an internal size threshold.
  */
 void phobic_query_batch(const phobic_phf *phf,
                          const char **keys,

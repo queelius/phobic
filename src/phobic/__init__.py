@@ -9,8 +9,8 @@ Public surface
 --------------
 
     phobic.build(keys, *, load_factor=0.5, seed=None,
-                 num_shards=None, num_threads=None,
-                 bucket_size=None, max_retries=100) -> PHF
+                 num_shards=None, num_threads=None, bucket_size=None,
+                 max_retries=100, assume_unique=False) -> PHF
     phobic.from_bytes(blob) -> PHF
     phobic.PHF        # the only exported type
 
@@ -26,8 +26,6 @@ Public surface
 
 from __future__ import annotations
 
-import copyreg as _copyreg  # noqa: F401  (referenced indirectly via __reduce__)
-
 __all__ = ['PHF', 'build', 'from_bytes']
 
 from phobic._module import (
@@ -41,6 +39,23 @@ from phobic._module import (
     num_shards  as _c_num_shards,
     bits_per_key as _c_bits_per_key,
 )
+
+
+def _encode_keys(keys):
+    """Normalise an iterable of keys to a ``list[bytes]`` for the C layer.
+
+    ``str`` is encoded as UTF-8; ``bytes`` is passed through untouched; any
+    other buffer-like object is converted with ``bytes()``. Passing ``bytes``
+    keys straight through avoids a per-key ``bytes()`` constructor call
+    (~1.9s for a 10M-key build) and avoids a real copy when a key is a
+    ``bytes`` subclass.
+    """
+    return [
+        k if isinstance(k, bytes)
+        else k.encode('utf-8') if isinstance(k, str)
+        else bytes(k)
+        for k in keys
+    ]
 
 
 class PHF:
@@ -61,9 +76,10 @@ class PHF:
     def lookup(self, keys, *, num_threads=None):
         """Batch query. Returns list[int] in the same order as input keys.
 
-        Parallel in C above an internal threshold; otherwise serial.
+        Parallel in C above an internal size threshold; pass num_threads=1
+        to force serial, or an explicit count to pin the worker count.
         """
-        raw = [k.encode('utf-8') if isinstance(k, str) else bytes(k) for k in keys]
+        raw = _encode_keys(keys)
         nt = 0 if num_threads is None else int(num_threads)
         return _c_query_batch(self._handle, raw, nt)
 
@@ -194,15 +210,7 @@ def build(keys, *, load_factor=0.5, seed=None, num_shards=None,
         if num_threads_c < 1:
             raise ValueError(f"num_threads must be >= 1 or None, got {num_threads}")
 
-    # Avoid the redundant `bytes(k)` copy when k is already bytes: it would
-    # allocate a fresh bytes object per key (1.9s at 10M). Use the original
-    # object directly and only copy/encode when the type genuinely needs it.
-    raw = [
-        k if isinstance(k, bytes)
-        else k.encode('utf-8') if isinstance(k, str)
-        else bytes(k)
-        for k in keys
-    ]
+    raw = _encode_keys(keys)
     if not raw:
         raise ValueError("keys must be non-empty")
     if not assume_unique and len(set(raw)) != len(raw):

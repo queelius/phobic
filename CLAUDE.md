@@ -58,8 +58,9 @@ Same `seed` produces byte-identical `to_bytes()` output regardless of `num_threa
 
 **Auto sharding**: `auto_num_shards(num_keys, num_threads)` picks `num_shards`. Currently:
 - N < 32K: single shard
-- 32K to ~512K: ~`N / 16K` shards (one shard's `bucket_size = ceil(log2(per_shard_N))` stays ≤ ~14)
-- Cap: `4 * num_threads` (may be relaxed for very large N; phase 5 sweep tunes this)
+- N >= 32K: `ceil(N / 16000)` shards (one shard's `bucket_size = ceil(log2(per_shard_N))` stays ≤ ~14)
+
+`num_threads` is accepted but deliberately ignored: `num_shards` is a pure function of `N`, so the same `seed` yields byte-identical output regardless of CPU count. There is no thread-based cap.
 
 See `.claude/SWEEP_BUCKET_SIZE.md` (0.2.0 era) and `.claude/SWEEP_0_3_0.md` (current) for measured trade-offs.
 
@@ -82,7 +83,7 @@ No backward read compat: 0.2.x `BOHP` and `PPHF` blobs are not readable. This is
 
 Thin Python-to-C glue. `phobic_phf*` lives in a `PyCapsule` whose destructor calls `phobic_free`. Exposes 9 module-level functions: `build`, `query`, `query_batch`, `serialize`, `deserialize`, `num_keys`, `range_size`, `num_shards`, `bits_per_key`.
 
-**GIL release invariant**: `Py_BEGIN_ALLOW_THREADS` brackets `phobic_build_with_diag` in `py_build` and `phobic_query_batch` in `py_query_batch`. The flat-key-buffer copy step before each is the safety contract: workers must not touch Python-owned memory under released GIL. Do not "simplify" the copy away.
+**GIL release invariant**: `Py_BEGIN_ALLOW_THREADS` brackets `phobic_build_with_diag` in `py_build` and `phobic_query_batch` in `py_query_batch`. Under the released GIL the C workers read key bytes directly through `PyBytes_AS_STRING` pointers. That is safe because `PyBytes` is immutable and the `keys` list (held alive by the call's argument tuple) keeps every key object alive for the whole call. The `key_ptrs` / `key_lens` arrays are populated *before* the GIL is released, since `PyList_GET_ITEM` and the type checks need the GIL. Invariant to preserve: never call the Python C-API under the released GIL. (Pre-0.3.1 also copied every key into a flat C buffer; that copy was removed for speed in 0.3.1 and should not be reintroduced.)
 
 **Error formatting**: `PyErr_Format` does not support `%f` or `%zu`. Build-failure diagnostics use `snprintf` into a 512-byte buffer + `PyErr_SetString`. The diagnostic format is part of the documented user surface (it tells callers how to tune the failing build).
 

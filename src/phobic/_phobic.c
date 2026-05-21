@@ -462,7 +462,8 @@ phobic_phf *phobic_build_with_diag(const char **keys,
 
     int max_retries = opts->max_retries > 0 ? opts->max_retries : 100;
 
-    /* Resolve threads first; auto_num_shards uses it. */
+    /* Resolve the worker-thread count. auto_num_shards takes num_threads
+     * but ignores it by design; only the cap below actually needs it. */
     int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (cpu_count < 1) cpu_count = 1;
     int num_threads = opts->num_threads > 0 ? opts->num_threads : cpu_count;
@@ -742,6 +743,13 @@ size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len) {
     size_t s = phf->num_shards == 1
         ? 0
         : shard_for_key(key, key_len, phf->shard_seed, phf->num_shards);
+    /* Empty shard: num_buckets and range are 0 and pilots is NULL, so the
+     * hashing below would divide by zero / deref NULL. Only reachable for a
+     * key not in the build set (built keys never hash to an empty shard)
+     * when num_shards exceeds the key spread. The contract for an out-of-set
+     * key is "some valid slot"; 0 is always valid. */
+    if (phf->shard_num_buckets[s] == 0)
+        return 0;
     dual_hash dh = hash_key(key, key_len, phf->shard_seeds[s]);
     size_t b = bucket_for(dh.h1, phf->shard_num_buckets[s]);
     size_t local = slot_with_pilot(dh.h2, phf->shard_pilots[s][b], phf->shard_range[s]);
@@ -778,6 +786,13 @@ void phobic_query_batch(const phobic_phf *phf,
                          size_t n,
                          size_t *out_slots,
                          int num_threads) {
+    /* num_threads <= 0 means "auto": resolve to the online CPU count, the
+     * same convention phobic_build_with_diag uses. This makes PHF.lookup()
+     * parallelise by default instead of silently staying single-threaded. */
+    if (num_threads <= 0) {
+        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = cpu > 1 ? (int)cpu : 1;
+    }
 #if PHOBIC_HAVE_PTHREAD
     if (num_threads > 1 && n >= PHOBIC_BATCH_THREADING_THRESHOLD) {
         /* Cap threads to n so we never have idle workers. */
@@ -824,7 +839,7 @@ serial:
 
 /* ── serialization (wire format v3) ───────────────────────────────────── */
 
-#define PHOBIC_MAGIC_V3 ((uint32_t)0x33464850) /* "PHF3" little-endian on the wire = 0x33,0x46,0x48,0x50 */
+#define PHOBIC_MAGIC_V3 ((uint32_t)0x33464850) /* little-endian: wire bytes 0x50 0x48 0x46 0x33 = "PHF3" */
 #define PHOBIC_VERSION  ((uint32_t)3)
 
 static inline void write_u16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
@@ -968,7 +983,11 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
         if ((s_poff & 7) != 0) { phobic_free(phf); return NULL; }
         if (s_nbck > SIZE_MAX / sizeof(uint16_t)) { phobic_free(phf); return NULL; }
         size_t pilot_bytes = (size_t)s_nbck * sizeof(uint16_t);
-        if (s_poff + pilot_bytes > buf_len) { phobic_free(phf); return NULL; }
+        /* s_poff + pilot_bytes can overflow uint64 on a hostile blob and
+         * wrap past the bound; check without adding (s_poff is untrusted). */
+        if (s_poff > buf_len || pilot_bytes > buf_len - s_poff) {
+            phobic_free(phf); return NULL;
+        }
 
         uint16_t *pilots = malloc(pilot_bytes);
         if (!pilots) { phobic_free(phf); return NULL; }
