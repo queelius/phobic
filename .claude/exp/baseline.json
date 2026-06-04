@@ -1,0 +1,266 @@
+{
+  "label": "baseline",
+  "phobic_version": "unknown",
+  "threads": [
+    1,
+    4,
+    12
+  ],
+  "results": [
+    {
+      "shape": "uniform16",
+      "n": 1000,
+      "reps": 7,
+      "build_ms": {
+        "1": 0.18028821796178818,
+        "4": 0.20532216876745224,
+        "12": 0.1875339075922966
+      },
+      "bits_per_key": 2.368,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 390.30006155371666,
+      "batch_ns_per_key": 120.42000889778139,
+      "determinism_ok": true
+    },
+    {
+      "shape": "uniform16",
+      "n": 100000,
+      "reps": 5,
+      "build_ms": {
+        "1": 115.38726277649403,
+        "4": 78.78651516512036,
+        "12": 63.04126977920532
+      },
+      "bits_per_key": 1.17184,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 571.5634673833847,
+      "batch_ns_per_key": 1288.2417999207973,
+      "determinism_ok": true
+    },
+    {
+      "shape": "uniform16",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 1802.7907279320061,
+        "4": 838.8523031026125,
+        "12": 501.1880612000823
+      },
+      "bits_per_key": 1.165232,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 1137.9055678844452,
+      "batch_ns_per_key": 784.2044346034527,
+      "determinism_ok": true
+    },
+    {
+      "shape": "short_str",
+      "n": 1000,
+      "reps": 7,
+      "build_ms": {
+        "1": 0.2293870784342289,
+        "4": 0.19923178479075432,
+        "12": 0.18516182899475098
+      },
+      "bits_per_key": 2.368,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 371.6759383678436,
+      "batch_ns_per_key": 125.56184083223343,
+      "determinism_ok": true
+    },
+    {
+      "shape": "short_str",
+      "n": 100000,
+      "reps": 5,
+      "build_ms": {
+        "1": 206.18307497352362,
+        "4": 81.02497877553105,
+        "12": 62.538952101022005
+      },
+      "bits_per_key": 1.17184,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 995.654985308647,
+      "batch_ns_per_key": 1179.299596697092,
+      "determinism_ok": true
+    },
+    {
+      "shape": "short_str",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 1254.5006689615548,
+        "4": 685.3081351146102,
+        "12": 578.0373099260032
+      },
+      "bits_per_key": 1.165472,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 1752.7352087199688,
+      "batch_ns_per_key": 2175.9042516350746,
+      "determinism_ok": true
+    },
+    {
+      "shape": "long_str",
+      "n": 1000,
+      "reps": 7,
+      "build_ms": {
+        "1": 0.20739063620567322,
+        "4": 0.29280828312039375,
+        "12": 0.246305949985981
+      },
+      "bits_per_key": 2.368,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 351.28509625792503,
+      "batch_ns_per_key": 148.81417155265808,
+      "determinism_ok": true
+    },
+    {
+      "shape": "long_str",
+      "n": 100000,
+      "reps": 5,
+      "build_ms": {
+        "1": 262.61446392163634,
+        "4": 112.6706562936306,
+        "12": 99.98410474509001
+      },
+      "bits_per_key": 1.1712,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 2005.425002425909,
+      "batch_ns_per_key": 3190.392814576626,
+      "determinism_ok": true
+    },
+    {
+      "shape": "long_str",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 2552.1220890805125,
+        "4": 1152.654823847115,
+        "12": 945.8820531144738
+      },
+      "bits_per_key": 1.16536,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 2591.080404818058,
+      "batch_ns_per_key": 1042.124256491661,
+      "determinism_ok": true
+    },
+    {
+      "shape": "int_bytes",
+      "n": 1000,
+      "reps": 7,
+      "build_ms": {
+        "1": 0.15295390039682388,
+        "4": 0.15080999583005905,
+        "12": 0.12704823166131973
+      },
+      "bits_per_key": 2.368,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 308.6552023887634,
+      "batch_ns_per_key": 97.19189256429672,
+      "determinism_ok": true
+    },
+    {
+      "shape": "int_bytes",
+      "n": 100000,
+      "reps": 5,
+      "build_ms": {
+        "1": 138.0368508398533,
+        "4": 81.22971141710877,
+        "12": 71.16474118083715
+      },
+      "bits_per_key": 1.17104,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 768.1078277528286,
+      "batch_ns_per_key": 1354.5061461627483,
+      "determinism_ok": true
+    },
+    {
+      "shape": "int_bytes",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 1668.6320090666413,
+        "4": 547.5365738384426,
+        "12": 535.1181398145854
+      },
+      "bits_per_key": 1.165584,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 962.4535217881203,
+      "batch_ns_per_key": 1126.5790089964867,
+      "determinism_ok": true
+    },
+    {
+      "shape": "skewed",
+      "n": 1000,
+      "reps": 7,
+      "build_ms": {
+        "1": 0.18370198085904121,
+        "4": 0.2330699935555458,
+        "12": 0.1565222628414631
+      },
+      "bits_per_key": 2.368,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 325.5316987633705,
+      "batch_ns_per_key": 107.73586109280586,
+      "determinism_ok": true
+    },
+    {
+      "shape": "skewed",
+      "n": 100000,
+      "reps": 5,
+      "build_ms": {
+        "1": 164.61692284792662,
+        "4": 82.09735667333007,
+        "12": 91.98919031769037
+      },
+      "bits_per_key": 1.172,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 1154.7969654202461,
+      "batch_ns_per_key": 1597.1316024661064,
+      "determinism_ok": true
+    },
+    {
+      "shape": "skewed",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 2569.6392599493265,
+        "4": 834.374425932765,
+        "12": 542.2942382283509
+      },
+      "bits_per_key": 1.165408,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 1483.3049848675728,
+      "batch_ns_per_key": 998.9587590098382,
+      "determinism_ok": true
+    }
+  ]
+}
