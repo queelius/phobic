@@ -801,10 +801,13 @@ static void *batch_worker(void *arg) {
 }
 #endif
 
-/* Threading threshold: pthread_create + join overhead (~10-50 us)
- * starts to amortise around N keys * per-key cost. At ~500 ns per query
- * this is ~1024 keys; below that, serial is faster. Phase 5 may tune. */
-#define PHOBIC_BATCH_THREADING_THRESHOLD ((size_t)1024)
+/* Threading threshold. Empirically (0.4.0 study, .claude/EXPERIMENTS_0_4_0.md),
+ * per-call pthread_create x N + join + GIL cycling costs hundreds of us, which
+ * dwarfs the ~100 ns/key query work until the batch is very large. The old
+ * 1024 threshold made moderate batches (1K-64K) 1.4x-63x SLOWER than serial.
+ * Parallel only reliably wins past ~256K keys (and only marginally without a
+ * persistent thread pool), so the threshold is set there. */
+#define PHOBIC_BATCH_THREADING_THRESHOLD ((size_t)262144)
 
 void phobic_query_batch(const phobic_phf *phf,
                          const char **keys,
