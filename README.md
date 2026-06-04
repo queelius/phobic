@@ -98,6 +98,8 @@ variable  per shard       (uint16 pilot blocks, 8-byte aligned)
 
 Fixed-size descriptor table + absolute pilot offsets means a future `phobic.from_file(path)` can mmap the blob directly without parsing variable-size sections. (Not in 0.3.0; the format pre-pays for it.)
 
+`from_bytes` validates structure (magic, version, descriptor/pilot bounds, shard-shape consistency) and raises `ValueError` on a malformed blob rather than crashing. It does not *authenticate* blobs: it is built for round-tripping trusted, locally-produced output (`to_bytes`, `multiprocessing` hand-off), not as a hardened parser for adversarial input. A structurally-valid blob from an untrusted source can still encode a wrong (but safe) mapping; treat deserialized data with the usual caution.
+
 ## Cross-process transport
 
 `PHF` instances support equality (`==`), `copy.deepcopy`, and the `__reduce__` protocol used by `multiprocessing.Pool`:

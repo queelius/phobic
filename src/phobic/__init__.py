@@ -1,4 +1,4 @@
-"""phobic 0.3.0: minimal-ish perfect hash functions for very large key sets.
+"""phobic: minimal-ish perfect hash functions for very large key sets.
 
 phobic builds a perfect hash function over a known key set. Always shards
 internally (one shard at small N is the degenerate case), always strict
@@ -41,19 +41,43 @@ from phobic._module import (
 )
 
 
+# The accepted key domain is uniform across build(), lookup(), and phf[key]:
+# str (UTF-8 encoded), bytes (passed through), and the bytes-like buffers
+# bytearray / memoryview (copied to bytes). Anything else is rejected loudly
+# rather than silently mangled -- notably int, where bytes(5) would be a
+# 5-byte zero buffer, not the integer 5 (a footgun that produced confusing
+# downstream build failures or unqueryable PHFs).
+def _reject_key(k):
+    raise TypeError(
+        f"keys must be str or bytes-like (bytes/bytearray/memoryview), "
+        f"got {type(k).__name__}")
+
+
+def _as_key(k):
+    """Normalise a single key to bytes for the scalar query path."""
+    if isinstance(k, bytes):
+        return k
+    if isinstance(k, str):
+        return k.encode('utf-8')
+    if isinstance(k, (bytearray, memoryview)):
+        return bytes(k)
+    _reject_key(k)
+
+
 def _encode_keys(keys):
     """Normalise an iterable of keys to a ``list[bytes]`` for the C layer.
 
-    ``str`` is encoded as UTF-8; ``bytes`` is passed through untouched; any
-    other buffer-like object is converted with ``bytes()``. Passing ``bytes``
-    keys straight through avoids a per-key ``bytes()`` constructor call
-    (~1.9s for a 10M-key build) and avoids a real copy when a key is a
-    ``bytes`` subclass.
+    ``str`` is encoded as UTF-8; ``bytes`` is passed through untouched;
+    ``bytearray`` / ``memoryview`` are copied to ``bytes``; anything else
+    raises ``TypeError``. Passing ``bytes`` keys straight through avoids a
+    per-key ``bytes()`` constructor call (~1.9s for a 10M-key build) and
+    avoids a real copy when a key is a ``bytes`` subclass.
     """
     return [
         k if isinstance(k, bytes)
         else k.encode('utf-8') if isinstance(k, str)
-        else bytes(k)
+        else bytes(k) if isinstance(k, (bytearray, memoryview))
+        else _reject_key(k)
         for k in keys
     ]
 
@@ -69,16 +93,17 @@ class PHF:
     # ── query ────────────────────────────────────────────────────────
 
     def __getitem__(self, key):
-        if isinstance(key, str):
-            key = key.encode('utf-8')
-        return _c_query(self._handle, key)
+        return _c_query(self._handle, _as_key(key))
 
     def lookup(self, keys, *, num_threads=None):
         """Batch query. Returns list[int] in the same order as input keys.
 
         Parallel in C above an internal size threshold; pass num_threads=1
         to force serial, or an explicit count to pin the worker count.
+        Accepts the same key domain as build(): str / bytes / bytes-like.
         """
+        if num_threads is not None and int(num_threads) < 1:
+            raise ValueError(f"num_threads must be >= 1 or None, got {num_threads}")
         raw = _encode_keys(keys)
         nt = 0 if num_threads is None else int(num_threads)
         return _c_query_batch(self._handle, raw, nt)
@@ -145,18 +170,20 @@ def build(keys, *, load_factor=0.5, seed=None, num_shards=None,
 
     Parameters
     ----------
-    keys : iterable of str or bytes
-        Must be unique and non-empty.
+    keys : iterable of str or bytes-like
+        str (UTF-8 encoded), bytes, bytearray, or memoryview. Must be unique
+        and non-empty. Other types (e.g. int) raise TypeError.
     load_factor : float, optional
-        ``num_keys / range_size``, in (0, 1]. 1.0 = MPHF (hardest to build);
-        0.5 (default) = 2x range overhead, fast build.
+        ``num_keys / range_size``, in (0, 1]. 1.0 = exact MPHF: a successful
+        build has range_size == num_keys, otherwise it raises (strict, never
+        silently relaxed). 0.5 (default) = 2x range overhead, fast build.
     seed : int, optional
         Reproducibility knob. ``None`` uses a random 64-bit seed.
     num_shards : int, optional
         Number of internal shards. ``None`` picks a data-driven default:
-        1 below ~32K keys, ``ceil(N / 16K)`` above. Independent of
-        ``num_threads``, so the same seed yields byte-identical output
-        across machines with different CPU counts.
+        1 below ~32K keys, ``ceil(N / 16000)`` above (decimal 16000, not
+        16384). Independent of ``num_threads``, so the same seed yields
+        byte-identical output across machines with different CPU counts.
     num_threads : int, optional
         Worker thread count for parallel build. ``None`` uses CPU count.
     bucket_size : int, optional

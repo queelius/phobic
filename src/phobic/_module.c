@@ -15,7 +15,7 @@ static inline double pp_now(void) {
             (label), (pp_now() - (t0)) * 1000.0)
 #endif
 
-/* phobic 0.3.0 Python C extension.
+/* phobic 0.3.2 Python C extension.
  *
  * Public surface (called from phobic/__init__.py):
  *   build(keys, load_factor, seed, max_retries, bucket_size, num_shards, num_threads)
@@ -36,6 +36,16 @@ static inline double pp_now(void) {
 static void phf_capsule_destructor(PyObject *capsule) {
     phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
     phobic_free(phf);
+}
+
+/* Parse a single-capsule arg tuple and return the wrapped phobic_phf*.
+ * Returns NULL with a Python exception already set on any error (bad arg
+ * tuple, wrong capsule type). Used by the introspection accessors and the
+ * serialize prologue, which all share this exact unpacking ritual. */
+static phobic_phf *phf_from_args(PyObject *args) {
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    return (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
 }
 
 /* ── build ─────────────────────────────────────────────────────────── */
@@ -238,10 +248,7 @@ static PyObject *py_query_batch(PyObject *self, PyObject *args) {
 
 static PyObject *py_serialize(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
-
-    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    phobic_phf *phf = phf_from_args(args);
     if (!phf) return NULL;
 
     size_t needed = phobic_serialize(phf, NULL, 0);
@@ -281,36 +288,28 @@ static PyObject *py_deserialize(PyObject *self, PyObject *args) {
 
 static PyObject *py_num_keys(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
-    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    phobic_phf *phf = phf_from_args(args);
     if (!phf) return NULL;
     return PyLong_FromSize_t(phf->num_keys);
 }
 
 static PyObject *py_range_size(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
-    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    phobic_phf *phf = phf_from_args(args);
     if (!phf) return NULL;
     return PyLong_FromSize_t(phf->total_range);
 }
 
 static PyObject *py_num_shards(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
-    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    phobic_phf *phf = phf_from_args(args);
     if (!phf) return NULL;
     return PyLong_FromSize_t(phf->num_shards);
 }
 
 static PyObject *py_bits_per_key(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
-    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    phobic_phf *phf = phf_from_args(args);
     if (!phf) return NULL;
     return PyFloat_FromDouble(phobic_bits_per_key(phf));
 }

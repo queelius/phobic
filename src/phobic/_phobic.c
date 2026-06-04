@@ -11,6 +11,12 @@
 #define PHOBIC_HAVE_PTHREAD 0
 #endif
 
+/* Wire format v3 fixed sizes (see phobic_serialize). Defined up front so the
+ * single layout walk (v3_layout) can be shared by serialized_size and
+ * phobic_serialize, keeping the size-vs-write contract from drifting. */
+#define V3_GLOBAL_HEADER_SIZE  56u
+#define V3_SHARD_DESC_SIZE     40u
+
 #ifdef PHOBIC_PROFILE
 #include <time.h>
 #include <stdio.h>
@@ -116,19 +122,25 @@ void phobic_free(phobic_phf *phf) {
     free(phf);
 }
 
-/* Total wire-format size in bytes (matches phobic_serialize layout).
- * 56 byte global header + 40 byte per shard descriptor + pilot blocks
- * with 8-byte alignment between them. */
-static size_t serialized_size(const phobic_phf *phf) {
-    size_t off = 56 + 40 * phf->num_shards;
-    /* Round to 8-byte boundary before first pilot block */
-    off = (off + 7) & ~(size_t)7;
+/* Single walk of the wire-format v3 layout: 56-byte global header + 40-byte
+ * per-shard descriptors + 8-byte-aligned uint16 pilot blocks. Returns the
+ * total padded size; if pilot_off is non-NULL, writes each shard's absolute
+ * 8-byte-aligned pilot-block offset into pilot_off[s]. serialized_size and
+ * phobic_serialize both go through this so the size computation and the write
+ * offsets can never disagree. */
+static size_t v3_layout(const phobic_phf *phf, size_t *pilot_off) {
+    size_t off = V3_GLOBAL_HEADER_SIZE + V3_SHARD_DESC_SIZE * phf->num_shards;
+    off = (off + 7) & ~(size_t)7;  /* align before first pilot block */
     for (size_t s = 0; s < phf->num_shards; s++) {
+        if (pilot_off) pilot_off[s] = off;
         off += phf->shard_num_buckets[s] * sizeof(uint16_t);
-        if (s + 1 < phf->num_shards)
-            off = (off + 7) & ~(size_t)7;
+        if (s + 1 < phf->num_shards) off = (off + 7) & ~(size_t)7;
     }
     return off;
+}
+
+static size_t serialized_size(const phobic_phf *phf) {
+    return v3_layout(phf, NULL);
 }
 
 double phobic_bits_per_key(const phobic_phf *phf) {
@@ -335,8 +347,20 @@ static int build_one_shard(
     for (int attempt = 0; attempt < max_retries; attempt++) {
         uint64_t cur_seed = splitmix64(base_seed
             ^ ((uint64_t)attempt * 0xD2B74407B1CE6E93ULL));
-        cur_lf = load_factor - LF_BUMP * (double)(attempt / BUMP_INTERVAL);
-        if (cur_lf <= 0.01) cur_lf = 0.01;
+        /* Effective load factor for this attempt. For load_factor < 1.0 we
+         * relax it slightly every BUMP_INTERVAL attempts to rescue hard shards
+         * (a wider range is easier to fill, and the user asked for a target,
+         * not minimality). For an exact MPHF (load_factor == 1.0) we never
+         * relax below 1.0: range stays == shard_n so the "range == num_keys"
+         * guarantee holds. The per-attempt seed change is then the only lever,
+         * and a shard that cannot be solved minimally fails with a diagnostic
+         * rather than silently widening into a non-minimal PHF. */
+        if (load_factor < 1.0) {
+            cur_lf = load_factor - LF_BUMP * (double)(attempt / BUMP_INTERVAL);
+            if (cur_lf <= 0.01) cur_lf = 0.01;
+        } else {
+            cur_lf = 1.0;
+        }
 
         size_t range = (size_t)ceil((double)shard_n / cur_lf);
         /* MPHF mode (load_factor=1.0) allows range == shard_n exactly.
@@ -747,8 +771,10 @@ size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len) {
      * hashing below would divide by zero / deref NULL. Only reachable for a
      * key not in the build set (built keys never hash to an empty shard)
      * when num_shards exceeds the key spread. The contract for an out-of-set
-     * key is "some valid slot"; 0 is always valid. */
-    if (phf->shard_num_buckets[s] == 0)
+     * key is "some valid slot"; 0 is always valid. The range==0 arm is
+     * defence-in-depth (deserialize already rejects buckets>0 with range==0;
+     * this keeps the query total even if a future path slips one through). */
+    if (phf->shard_num_buckets[s] == 0 || phf->shard_range[s] == 0)
         return 0;
     dual_hash dh = hash_key(key, key_len, phf->shard_seeds[s]);
     size_t b = bucket_for(dh.h1, phf->shard_num_buckets[s]);
@@ -822,8 +848,23 @@ void phobic_query_batch(const phobic_phf *phf,
             if (pthread_create(&threads[t], NULL, batch_worker, &chunks[t]) == 0) {
                 spawned++;
             } else {
-                /* Spawn failed; do this and remaining chunks on the calling thread. */
-                for (int u = t; u < num_threads; u++) batch_worker(&chunks[u]);
+                /* Spawn failed; run this chunk and all remaining chunks on the
+                 * calling thread. chunks[t] is already initialized, but
+                 * chunks[t+1..] are not (they get filled at the top of their
+                 * own iteration), so fill each before running it. `cursor`
+                 * currently points at the start of chunk t+1. */
+                batch_worker(&chunks[t]);
+                for (int u = t + 1; u < num_threads; u++) {
+                    size_t uc = per + ((size_t)u < rem ? 1 : 0);
+                    chunks[u].phf       = phf;
+                    chunks[u].keys      = keys;
+                    chunks[u].key_lens  = key_lens;
+                    chunks[u].out_slots = out_slots;
+                    chunks[u].start     = cursor;
+                    chunks[u].end       = cursor + uc;
+                    cursor += uc;
+                    batch_worker(&chunks[u]);
+                }
                 break;
             }
         }
@@ -860,30 +901,18 @@ static inline uint64_t read_u64(const uint8_t *p) {
     return (uint64_t)read_u32(p) | ((uint64_t)read_u32(p+4)<<32);
 }
 
-#define V3_GLOBAL_HEADER_SIZE  56u
-#define V3_SHARD_DESC_SIZE     40u
-
 size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     if (!phf) return 0;
     size_t total = serialized_size(phf);
     if (!buf) return total;
     if (buf_len < total) return 0;
 
-    /* Compute pilot block offsets (8-byte aligned). */
     size_t descriptors_off = V3_GLOBAL_HEADER_SIZE;
-    size_t pilots_start = descriptors_off + V3_SHARD_DESC_SIZE * phf->num_shards;
-    pilots_start = (pilots_start + 7) & ~(size_t)7;
 
+    /* Pilot-block offsets, from the same layout walk serialized_size used. */
     size_t *pilot_off = malloc(phf->num_shards * sizeof(size_t));
     if (!pilot_off) return 0;
-    {
-        size_t cur = pilots_start;
-        for (size_t s = 0; s < phf->num_shards; s++) {
-            pilot_off[s] = cur;
-            cur += phf->shard_num_buckets[s] * sizeof(uint16_t);
-            if (s + 1 < phf->num_shards) cur = (cur + 7) & ~(size_t)7;
-        }
-    }
+    v3_layout(phf, pilot_off);
 
     /* Zero-fill the buffer first (cheap; covers all alignment padding). */
     memset(buf, 0, total);
@@ -965,6 +994,17 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
         uint64_t s_nbck   = read_u64(d + 16);
         uint64_t s_range  = read_u64(d + 24);
         uint64_t s_poff   = read_u64(d + 32);
+
+        /* Shard shape consistency: a genuinely empty shard has BOTH zero
+         * buckets and zero range; a populated shard has both positive. Any
+         * other combination is corrupt and would divide by zero at query time
+         * (bucket_for does h1 % num_buckets, slot_with_pilot does mixed % range).
+         * Reject rather than accept-then-crash-on-query. */
+        if ((s_nbck == 0) != (s_range == 0)) { phobic_free(phf); return NULL; }
+
+        /* Overflow-guard the running range sum so the cumulative == total_range
+         * check below is meaningful rather than satisfiable by wraparound. */
+        if (cumulative > SIZE_MAX - (size_t)s_range) { phobic_free(phf); return NULL; }
 
         phf->shard_seeds[s]       = s_seed;
         phf->shard_bucket_size[s] = (size_t)s_bsize;

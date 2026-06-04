@@ -1,4 +1,4 @@
-"""Core API tests for phobic 0.3.0."""
+"""Core API tests for phobic."""
 from __future__ import annotations
 
 import copy
@@ -535,3 +535,135 @@ def test_build_and_lookup_accept_bytes_subclass():
     plain = [bytes(k) for k in keys]
     assert phf.lookup(plain) == phf.lookup(keys)
     assert phf.to_bytes() == phobic.build(plain, seed=0).to_bytes()
+
+
+# ── empty-shard robustness: batch path + round-trip ───────────────────
+
+
+def test_query_on_empty_shard_batch_does_not_crash():
+    """Same empty-shard hazard through the parallel batch path, where a crash
+    would fire inside a GIL-released pthread worker and abort the interpreter.
+    Subprocess-isolated like the scalar variant."""
+    import subprocess, sys
+    code = (
+        "import phobic\n"
+        "phf = phobic.build([b'a', b'b'], num_shards=64, seed=0)\n"
+        "strangers = [b'miss-%d' % i for i in range(4000)]\n"  # > 1024 threshold
+        "slots = phf.lookup(strangers, num_threads=4)\n"
+        "assert all(0 <= s < phf.range_size for s in slots)\n"
+        "print('OK')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, (
+        f"empty-shard batch query crashed: rc={r.returncode} stderr={r.stderr!r}")
+    assert "OK" in r.stdout
+
+
+def test_empty_shard_build_round_trips():
+    """A build with empty shards must serialize and deserialize cleanly
+    (determinism preserved) and agree on in-set keys."""
+    keys = [f"k{i}".encode() for i in range(50)]
+    phf = phobic.build(keys, num_shards=400, seed=1)
+    phf2 = phobic.from_bytes(phf.to_bytes())
+    assert phf == phf2
+    for k in keys:
+        assert phf[k] == phf2[k]
+
+
+# ── deserialize rejects malformed-but-structurally-plausible blobs ────
+
+
+def _tamper(blob, *edits):
+    """Apply (offset, u64_value) edits to a copy of blob. Header is 56 bytes;
+    shard-0 descriptor starts at 56 (seed@+0, bsize@+8, nbck@+16, range@+24,
+    poff@+32)."""
+    import struct
+    b = bytearray(blob)
+    for off, val in edits:
+        struct.pack_into("<Q", b, off, val)
+    return bytes(b)
+
+
+def test_deserialize_rejects_zero_range_with_buckets():
+    """A populated shard (num_buckets>0) with range==0 would divide by zero in
+    slot_with_pilot at query time; deserialize must reject it."""
+    phf = phobic.build([b"a", b"b", b"c", b"d"], load_factor=0.9, seed=42)
+    bad = _tamper(phf.to_bytes(), (56 + 24, 0), (16, 0))  # shard0 range, total_range
+    with pytest.raises(ValueError):
+        phobic.from_bytes(bad)
+
+
+def test_deserialize_rejects_zero_buckets_with_range():
+    """A populated shard mislabeled with num_buckets==0 would divide by zero in
+    bucket_for at query time; deserialize must reject it."""
+    phf = phobic.build([b"a", b"b", b"c", b"d"], load_factor=0.9, seed=42)
+    bad = _tamper(phf.to_bytes(), (56 + 16, 0))  # shard0 num_buckets
+    with pytest.raises(ValueError):
+        phobic.from_bytes(bad)
+
+
+# ── key-domain consistency across build / lookup / __getitem__ ────────
+
+
+def test_build_rejects_int_keys():
+    """int keys are a footgun (bytes(5) is a 5-byte zero buffer, not 5);
+    reject them loudly rather than silently mangling."""
+    with pytest.raises(TypeError):
+        phobic.build([1, 2, 3])
+
+
+def test_getitem_accepts_bytearray_and_memoryview():
+    """phf[key] accepts the same bytes-like domain as build()/lookup()."""
+    keys = [b"alpha", b"beta", b"gamma"]
+    phf = phobic.build(keys, seed=1)
+    for k in keys:
+        expected = phf[k]
+        assert phf[bytearray(k)] == expected
+        assert phf[memoryview(k)] == expected
+
+
+def test_lookup_validates_num_threads():
+    """lookup() enforces the same num_threads >= 1 contract as build()."""
+    phf = phobic.build([b"a", b"b", b"c"], seed=1)
+    with pytest.raises(ValueError, match="num_threads"):
+        phf.lookup([b"a"], num_threads=-5)
+
+
+# ── strict MPHF: load_factor=1.0 is minimal-or-fails ──────────────────
+
+
+@pytest.mark.parametrize("n", [50, 100])
+def test_mphf_success_is_always_minimal(n):
+    """A successful load_factor=1.0 build must have range_size == num_keys
+    exactly. The retry path must never relax the range for an exact MPHF."""
+    keys = [f"k{i}".encode() for i in range(n)]
+    succeeded = 0
+    for seed in range(6):
+        try:
+            phf = phobic.build(keys, load_factor=1.0, seed=seed, max_retries=200)
+        except RuntimeError:
+            continue  # MPHF can legitimately fail; strict contract
+        assert phf.range_size == n, (
+            f"non-minimal MPHF: n={n} seed={seed} range={phf.range_size}")
+        succeeded += 1
+    assert succeeded > 0, f"no MPHF build succeeded for n={n} (test inconclusive)"
+
+
+@pytest.mark.slow
+def test_mphf_never_silently_non_minimal():
+    """Regression: load_factor=1.0 must never return range_size > num_keys.
+    This multi-shard config previously relaxed to range_size=2197 for 2000
+    keys after the per-shard retry budget crossed the LF-bump interval. A
+    failed (raised) build is the acceptable strict outcome; a non-minimal
+    success is not. Marked slow: the strict-fail path exhausts the full
+    per-shard retry budget, which is intentionally expensive."""
+    keys = [f"k{i}".encode() for i in range(2000)]
+    for seed in range(8):
+        try:
+            phf = phobic.build(keys, load_factor=1.0, seed=seed,
+                               num_shards=4, max_retries=300)
+        except RuntimeError:
+            continue
+        assert phf.range_size == len(phf), (
+            f"MPHF silently non-minimal: range_size={phf.range_size} "
+            f"num_keys={len(phf)} (seed={seed})")
