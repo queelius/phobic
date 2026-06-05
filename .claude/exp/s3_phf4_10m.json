@@ -1,0 +1,79 @@
+{
+  "label": "s3_phf4_10m",
+  "phobic_version": "unknown",
+  "threads": [
+    1,
+    4,
+    12
+  ],
+  "results": [
+    {
+      "shape": "uniform16",
+      "n": 1000,
+      "reps": 4,
+      "build_ms": {
+        "1": 0.24785799905657768,
+        "4": 0.16853492707014084,
+        "12": 0.2282564528286457
+      },
+      "bits_per_key": 1.8,
+      "range_size": 2000,
+      "num_shards": 1,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 327.4618647992611,
+      "batch_ns_per_key": 114.83486741781235,
+      "determinism_ok": true
+    },
+    {
+      "shape": "uniform16",
+      "n": 100000,
+      "reps": 2,
+      "build_ms": {
+        "1": 154.7546957153827,
+        "4": 59.43514802493155,
+        "12": 70.78513945452869
+      },
+      "bits_per_key": 0.89024,
+      "range_size": 200000,
+      "num_shards": 7,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 444.9637606739998,
+      "batch_ns_per_key": 257.5353719294071,
+      "determinism_ok": true
+    },
+    {
+      "shape": "uniform16",
+      "n": 1000000,
+      "reps": 3,
+      "build_ms": {
+        "1": 1721.3948662392795,
+        "4": 780.0374110229313,
+        "12": 432.94802866876125
+      },
+      "bits_per_key": 0.88964,
+      "range_size": 2000000,
+      "num_shards": 63,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 870.9816262125969,
+      "batch_ns_per_key": 483.6638458073139,
+      "determinism_ok": true
+    },
+    {
+      "shape": "uniform16",
+      "n": 10000000,
+      "reps": 2,
+      "build_ms": {
+        "1": 15506.254249019548,
+        "4": 5452.828079462051,
+        "12": 3625.852414406836
+      },
+      "bits_per_key": 0.8873632,
+      "range_size": 20000000,
+      "num_shards": 625,
+      "range_over_keys": 2.0,
+      "scalar_ns_per_key": 3039.3309891223907,
+      "batch_ns_per_key": 263.5931596159935,
+      "determinism_ok": true
+    }
+  ]
+}

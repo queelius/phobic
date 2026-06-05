@@ -19,9 +19,10 @@ phf = phobic.build(keys)
 
 # Query
 phf[b"key_42"]                  # scalar -> int slot
-phf.lookup(keys[:100])          # batch -> list[int] (parallel C above ~1K keys)
+phf.lookup(keys[:100])          # batch -> list[int]
+phf.lookup_fixed(arr)           # bulk: numpy (N, W) uint8 -> uint64 array (up to ~16x)
 
-# Persist (wire format v3, mmap-friendly layout)
+# Persist (wire format v4, mmap-friendly layout)
 data = phf.to_bytes()
 phf2 = phobic.from_bytes(data)
 assert phf == phf2
@@ -66,7 +67,7 @@ If a build can't find a perfect hash within `max_retries`, phobic raises a `Runt
 Both the build and `lookup()` release the GIL and fan out across pthreads:
 
 - **Build** parallelism is per-shard. At `num_shards=1` the build is single-threaded; above that it scales nearly linearly to `num_threads`.
-- **Batch query** is chunked across `num_threads` above an internal threshold (~1024 keys). Below the threshold the call is serial.
+- **Batch query** stays serial below an internal threshold (~256K keys) and chunks across `num_threads` above it. Per-call thread-spawn cost makes serial faster for small and moderate batches; for the fastest bulk path use `lookup_fixed` (numpy).
 
 Determinism is preserved: same `seed` and same `num_shards` produce byte-identical `to_bytes()` regardless of `num_threads`.
 
@@ -74,29 +75,29 @@ Determinism is preserved: same `seed` and same `num_shards` produce byte-identic
 
 Measured on a 12-core machine, default `load_factor=0.5`, 16-byte uniform keys (cipher-maps shape):
 
-| N | num_shards | bpk | build @ 12 threads | with `assume_unique=True` |
-|---:|---:|---:|---:|---:|
-| 100K | 7 | 1.17 | 26 ms | 26 ms |
-| 1M | 63 | 1.17 | 306 ms | ~250 ms |
-| 10M | 625 | 1.16 | **2.37 s** | **1.18 s** |
+| N | num_shards | bits/key | build @ 12 threads (`assume_unique=True`) |
+|---:|---:|---:|---:|
+| 100K | 7 | 0.89 | ~25 ms |
+| 1M | 63 | 0.89 | ~250 ms |
+| 10M | 625 | **0.89** | **~1.2 s** |
 
-`assume_unique=True` skips the Python-side uniqueness check (a 2-second `set(raw)` hash at 10M keys). For callers whose keys are unique by construction (e.g. cipher-maps, HMAC outputs), this is pure win.
+bits/key dropped from ~1.16 (0.3.x) to **~0.89 in 0.4.0** (about 24% smaller blobs) via the PHF4 bit-packed pilot format. `assume_unique=True` skips the Python-side uniqueness check (a 2-second `set(raw)` hash at 10M keys); for callers whose keys are unique by construction (e.g. cipher-maps, HMAC outputs), this is pure win.
 
-vs phobic 0.2.0: 1M parallel went from 2.0 s to 0.34 s (5.9x). 10M went from "would not finish" serially in 0.2.0 to ~1.2 s parallel in 0.3.1 with `assume_unique=True`.
+Bulk query: `lookup_fixed` (numpy) reaches ~9 ns/key at 1M (up to ~16x faster than `lookup(list)`) when keys are already in a contiguous buffer, by skipping per-key Python objects.
 
-vs maph's `partitioned_phf<phobic4>` (the reference in the sibling research repo): at 10M, phobic 0.3.1 is 6x faster and uses 2.4x fewer bits per key. See `.claude/SWEEP_0_3_0.md` for the full sweep.
+vs maph's `partitioned_phf<phobic4>` (the reference in the sibling research repo): at 10M, phobic is several x faster and uses ~3x fewer bits per key. See `.claude/EXPERIMENTS_0_4_0.md` for the 0.4.0 efficiency study.
 
 ## Wire format
 
-`phf.to_bytes()` produces a versioned, mmap-friendly v3 blob (magic `b"PHF3"`):
+`phf.to_bytes()` produces a versioned, mmap-friendly v4 blob (magic `b"PHF4"`):
 
 ```
 56 bytes  global header   (num_keys, total_range, num_shards, seed, shard_seed)
-40 bytes  per shard       (descriptor table, fixed-size, indexable)
-variable  per shard       (uint16 pilot blocks, 8-byte aligned)
+48 bytes  per shard       (descriptor table, fixed-size, indexable; incl. pilot_bits)
+variable  per shard       (bit-packed pilot blocks at pilot_bits/shard, 8-byte aligned)
 ```
 
-Fixed-size descriptor table + absolute pilot offsets means a future `phobic.from_file(path)` can mmap the blob directly without parsing variable-size sections. (Not in 0.3.0; the format pre-pays for it.)
+Pilots are packed at the minimum fixed bit width per shard (typically ~13 bits, vs the old 16), which is where the ~24% size reduction comes from; they are unpacked on load, so query speed is unchanged. Fixed-size descriptor table + absolute pilot offsets means a future `phobic.from_file(path)` can mmap the blob directly without parsing variable-size sections. The 0.3.x `PHF3` format is not readable by 0.4.0 (rebuild persisted blobs; see `MIGRATION.md`).
 
 `from_bytes` validates structure (magic, version, descriptor/pilot bounds, shard-shape consistency) and raises `ValueError` on a malformed blob rather than crashing. It does not *authenticate* blobs: it is built for round-tripping trusted, locally-produced output (`to_bytes`, `multiprocessing` hand-off), not as a hardened parser for adversarial input. A structurally-valid blob from an untrusted source can still encode a wrong (but safe) mapping; treat deserialized data with the usual caution.
 

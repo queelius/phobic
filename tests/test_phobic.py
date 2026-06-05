@@ -334,10 +334,17 @@ def test_serialization_round_trip_multi_shard():
         assert phf[k] == phf2[k]
 
 
-def test_wire_magic_is_phf3():
-    """Wire format v3 magic on the wire is b'PHF3'."""
+def test_wire_magic_is_phf4():
+    """Wire format v4 magic on the wire is b'PHF4'."""
     phf = phobic.build([b"x"], seed=0)
-    assert phf.to_bytes()[:4] == b"PHF3"
+    assert phf.to_bytes()[:4] == b"PHF4"
+
+
+def test_wire_format_rejects_old_v3_phf3():
+    """0.3.x 'PHF3' magic is not readable by 0.4.0 (clean break to bit-packed
+    pilots)."""
+    with pytest.raises(ValueError):
+        phobic.from_bytes(b"PHF3" + b"\x03\x00\x00\x00" + b"\x00" * 100)
 
 
 def test_wire_format_rejects_unknown_magic():
@@ -360,14 +367,14 @@ def test_wire_format_rejects_old_v2_phob():
 
 def test_pilots_offset_is_8_byte_aligned():
     """The wire format guarantees pilot blocks start on 8-byte boundaries
-    (mmap-friendly). Decode the descriptor table and verify."""
+    (mmap-friendly). v4 descriptor is 48 bytes; pilots_offset is at +40."""
     import struct
     keys = make_keys(500)
     phf = phobic.build(keys, num_shards=4, seed=0)
     blob = phf.to_bytes()
     num_shards = struct.unpack_from("<Q", blob, 24)[0]
     for s in range(num_shards):
-        pilots_off = struct.unpack_from("<Q", blob, 56 + 40 * s + 32)[0]
+        pilots_off = struct.unpack_from("<Q", blob, 56 + 48 * s + 40)[0]
         assert pilots_off % 8 == 0, f"shard {s} pilots_offset={pilots_off} not 8-byte aligned"
 
 
@@ -485,9 +492,9 @@ def test_wire_format_rejects_overflowing_pilot_offset():
     phf = phobic.build(make_keys(100), num_shards=1, seed=0)
     blob = bytearray(phf.to_bytes())
     num_buckets = struct.unpack_from("<Q", blob, 56 + 16)[0]
-    assert num_buckets >= 4  # need pilot_bytes >= 8 so the offset can wrap
-    # pilots_offset is the 5th u64 of shard descriptor 0 (descriptor at 56).
-    struct.pack_into("<Q", blob, 56 + 32, (1 << 64) - 8)
+    assert num_buckets >= 4  # need a packed block so the offset can wrap
+    # v4 descriptor (48B): pilots_offset is the 6th u64, at +40.
+    struct.pack_into("<Q", blob, 56 + 40, (1 << 64) - 8)
     with pytest.raises(ValueError):
         phobic.from_bytes(bytes(blob))
 
@@ -522,6 +529,29 @@ def test_lookup_default_threads_matches_scalar_large_batch():
     keys = make_keys(5000)  # well above the 1024-key threading threshold
     phf = phobic.build(keys, seed=7)
     assert phf.lookup(keys) == [phf[k] for k in keys]
+
+
+def test_lookup_fixed_matches_scalar():
+    """The numpy fixed-width bulk path returns the same slots as scalar/list
+    query, as a uint64 ndarray of the right shape."""
+    np = pytest.importorskip("numpy")
+    keys = [f"k{i:013d}".encode() for i in range(5000)]  # all 14 bytes
+    phf = phobic.build(keys, seed=2)
+    arr = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(len(keys), 14)
+    fx = phf.lookup_fixed(arr)
+    assert fx.dtype == np.uint64 and fx.shape == (len(keys),)
+    assert list(fx) == [phf[k] for k in keys]
+    assert list(fx) == phf.lookup(keys)
+
+
+def test_lookup_fixed_validates_shape_and_threads():
+    np = pytest.importorskip("numpy")
+    phf = phobic.build([b"aa", b"bb", b"cc"], seed=0)
+    with pytest.raises(ValueError):  # 1-D, not (N, width)
+        phf.lookup_fixed(np.zeros(6, dtype=np.uint8))
+    arr = np.frombuffer(b"aabbcc", dtype=np.uint8).reshape(3, 2)
+    with pytest.raises(ValueError, match="num_threads"):
+        phf.lookup_fixed(arr, num_threads=0)
 
 
 def test_build_and_lookup_accept_bytes_subclass():

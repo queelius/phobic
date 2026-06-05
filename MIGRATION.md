@@ -1,3 +1,31 @@
+# Migrating from phobic 0.3.x to 0.4.0
+
+0.4.0 is a space + query efficiency release. The public API is unchanged; the
+one breaking change is the wire format.
+
+## What changed
+
+- **Wire format break: `PHF3` -> `PHF4`.** Pilots are now bit-packed at the
+  minimum fixed width per shard instead of `uint16`, cutting serialized size by
+  **~24%** (bits/key ~1.16 -> ~0.89). Blobs from 0.3.x (`PHF3`) are **not
+  readable** by 0.4.0; rebuild any persisted PHFs from the source key set.
+  `to_bytes()` / `from_bytes()` calls are unchanged; only the bytes differ
+  (smaller, and `b"PHF4..."` magic). Build, query, and determinism are unchanged.
+- **`PHF.lookup_fixed(arr)` (new, optional).** A numpy bulk-query path: pass a
+  C-contiguous `(N, width)` uint8 array, get back a `uint64` numpy array. Skips
+  all per-key Python objects, so it is up to ~16x faster than `lookup(list)` for
+  large batches of uniform-width keys (when keys are already in a buffer).
+  Requires numpy (optional dependency); `lookup` / `build` stay numpy-free.
+- **Batch-query threshold raised (perf fix).** `lookup()` now stays serial below
+  ~256K keys, where per-call thread spawn made the 0.3.2 parallel-by-default path
+  1.4x-63x slower for moderate batches. No API change; moderate-batch `lookup()`
+  is now much faster. Pass an explicit `num_threads` to override.
+
+No code changes are required beyond rebuilding any persisted blobs. The
+`alpha`/`PartitionedPHF`/etc. notes below are for the older 0.2 -> 0.3 jump.
+
+---
+
 # Migrating from phobic 0.2.x to 0.3.0
 
 phobic 0.3.0 is an aggressive rewrite that collapses the dual `PHF` / `PartitionedPHF` design into a single unified type. Most calling sites need small mechanical changes; some uses need the rewrite to think differently. This guide covers both.

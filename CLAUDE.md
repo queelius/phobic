@@ -76,22 +76,24 @@ See `.claude/SWEEP_BUCKET_SIZE.md` (0.2.0 era) and `.claude/SWEEP_0_3_0.md` (cur
 
 **Threading model**: `phobic_build_with_diag` allocates per-shard buffers, distributes keys, then dispatches per-shard build either to a pthread work queue (when `num_threads > 1` and `PHOBIC_HAVE_PTHREAD`) or to a serial loop. After join, results are checked for the first failure; a diagnostic is filled into the optional `phobic_build_diag` struct.
 
-`phobic_query_batch` chunks the input range across `num_threads` workers when `n >= PHOBIC_BATCH_THREADING_THRESHOLD` (1024 today). Below the threshold, serial. Output slots are disjoint between workers, so no synchronisation is needed.
+`phobic_query_batch` chunks the input range across `num_threads` workers when `n >= PHOBIC_BATCH_THREADING_THRESHOLD` (262144 since 0.4.0; was 1024, which made moderate-batch `lookup()` 1.4x-63x slower than serial because per-call `pthread_create` x N dwarfs the ~100 ns/key work). Below the threshold, serial. Output slots are disjoint between workers, so no synchronisation is needed. `phobic_query_fixed_batch` is the same fan-out over a fixed-width contiguous key buffer writing `uint64` slots (the numpy `lookup_fixed` path).
 
 The pthread code is gated by `PHOBIC_HAVE_PTHREAD` (defined as `1` on non-Windows and `0` on Windows in `_phobic.c`). On Windows the build falls back to single-threaded and `phobic_query_batch` is serial. A pthread-w32 (or `<threads.h>`) port would lift that.
 
-**Wire format v3** (`b"PHF3"`): single magic, mmap-friendly layout.
+**Wire format v4** (`b"PHF4"`, since 0.4.0): single magic, mmap-friendly layout.
 - 56-byte global header (num_keys, total_range, num_shards, seed, shard_seed)
-- `40 * num_shards` bytes of fixed-size descriptor records (per-shard seed, bucket_size, num_buckets, range, absolute pilots offset)
-- 8-byte aligned variable-size pilot blocks (`uint16` per bucket)
+- `48 * num_shards` bytes of fixed-size descriptor records (per-shard seed, bucket_size, num_buckets, range, **pilot_bits**, absolute pilots offset)
+- 8-byte aligned, bit-packed pilot blocks: each shard's pilots packed at `pilot_bits[s]` fixed width = `ceil(log2(max_pilot+1))`, plus 8 bytes (`WIRE_TAIL_PAD`) so a 3-byte unaligned read of the last packed field stays in-bounds.
 
-Absolute `pilots_offset` per descriptor lets a future `phobic.from_file(path)` mmap the blob and access pilots without parsing variable-size sections. The format pre-pays the alignment cost (~24 bytes total) for that future feature.
+The bit-packing (vs the old `uint16` per bucket) is the ~24% size reduction in 0.4.0 (bits/key ~1.16 -> ~0.89). Pilots are unpacked to a `uint16` array on load, so build/query/struct are unchanged and query speed is unaffected; only `serialize`/`deserialize`/the layout walk (`wire_layout`) and the descriptor (`+pilot_bits`) changed. `read_bits_le`/`write_bits_le` do the LSB-first packing.
 
-No backward read compat: 0.2.x `BOHP` and `PPHF` blobs are not readable. This is documented in `MIGRATION.md`.
+Absolute `pilots_offset` per descriptor lets a future `phobic.from_file(path)` mmap the blob without parsing variable-size sections.
+
+No backward read compat: `PHF3` (0.3.x) and 0.2.x `BOHP`/`PPHF` blobs are not readable. Documented in `MIGRATION.md`. The clean break PHF3 -> PHF4 mirrors the 0.2 -> 0.3 break.
 
 ### C Extension (`src/phobic/_module.c`)
 
-Thin Python-to-C glue. `phobic_phf*` lives in a `PyCapsule` whose destructor calls `phobic_free`. Exposes 9 module-level functions: `build`, `query`, `query_batch`, `serialize`, `deserialize`, `num_keys`, `range_size`, `num_shards`, `bits_per_key`.
+Thin Python-to-C glue. `phobic_phf*` lives in a `PyCapsule` whose destructor calls `phobic_free`. Exposes 10 module-level functions: `build`, `query`, `query_batch`, `query_batch_fixed`, `serialize`, `deserialize`, `num_keys`, `range_size`, `num_shards`, `bits_per_key`. `query_batch_fixed` takes the key buffer via the buffer protocol (`y*`, no numpy linkage) and returns `uint64` bytes, so numpy stays an optional runtime dep used only by the Python `lookup_fixed` wrapper.
 
 **GIL release invariant**: `Py_BEGIN_ALLOW_THREADS` brackets `phobic_build_with_diag` in `py_build` and `phobic_query_batch` in `py_query_batch`. The safety contract for the released-GIL window relies on three things together: (1) input keys are normalised to `bytes` in Python before the C call, so the held list reference keeps every key alive; (2) `PyBytes` is immutable, so `PyBytes_AS_STRING` returns a stable pointer that workers can read without holding the GIL; (3) C allocates its own `key_ptrs` / `key_lens` arrays from those pointers, never touching the Python list during the parallel section. There is no flat-key-buffer memcpy: that was dropped in 0.3.1 (it was costing ~1.9s at 10M for no safety benefit). If you reintroduce a code path that derives a key buffer outside of "PyBytes held by an input list", re-justify the safety contract before releasing the GIL.
 
@@ -122,7 +124,7 @@ The key normalisation in `build()` deliberately avoids the redundant `bytes(k)` 
 
 ## Test Layout
 
-- `tests/test_phobic.py` (68 fast tests): core API, load_factor semantics + validation, num_shards (auto/explicit), num_threads determinism, bucket_size, seed reproducibility, build-failure diagnostic message, wire format magic + truncation + alignment, equality/copy/`__reduce__`, `assume_unique` opt-out behaviour, `__hash__ is None` (unhashable contract), distribution robustness across 4 key shapes, concurrent thread-safety, empty-shard stranger-query robustness (no SIGFPE), deserialize rejection of malformed-but-plausible blobs (zero range/buckets, overflowing pilot offset), key-domain consistency across `build`/`lookup`/`__getitem__`, and strict-MPHF minimality on the success path. One slow MPHF strict-fail regression lives here too (`@pytest.mark.slow`).
+- `tests/test_phobic.py` (71 fast tests): core API, load_factor semantics + validation, num_shards (auto/explicit), num_threads determinism, bucket_size, seed reproducibility, build-failure diagnostic message, wire format magic (`PHF4`) + truncation + alignment + old-`PHF3`-rejection, equality/copy/`__reduce__`, `assume_unique` opt-out behaviour, `__hash__ is None` (unhashable contract), distribution robustness across 4 key shapes, concurrent thread-safety, empty-shard stranger-query robustness (no SIGFPE), deserialize rejection of malformed-but-plausible blobs (zero range/buckets, overflowing pilot offset), key-domain consistency across `build`/`lookup`/`__getitem__`, strict-MPHF minimality on the success path, and `lookup_fixed` (numpy bulk path) correctness + validation. One slow MPHF strict-fail regression lives here too (`@pytest.mark.slow`).
 - `tests/test_scale.py` (3 tests, all `@pytest.mark.slow`): builds at 1M and 10M, serialisation round-trip at 1M.
 - Slow suite total: 4 tests (`pytest -m slow`).
 
@@ -142,9 +144,34 @@ Optional profiling build: `CFLAGS="-DPHOBIC_PROFILE=1" pip install -e .` enables
 
 ## Version snapshot
 
-Current version: 0.3.2 (`pyproject.toml`).
+Current version: 0.4.0 (`pyproject.toml`).
 
-0.3.2 integrates two parallel review efforts: commit `4248043` (the
+0.4.0 is the efficiency release from the study in `.claude/EXPERIMENTS_0_4_0.md`
+(plan in `.claude/DESIGN_EXPERIMENTS_0_4_0.md`). Three shipped wins:
+
+- **S3 (space): PHF4 bit-packed pilots, ~24% smaller blobs** (bits/key ~1.16 -> ~0.89, validated at 10M). Wire format breaks PHF3 -> PHF4 (see the C Core wire-format section and `MIGRATION.md`). Build/query/determinism unchanged; bits/key is deterministic so the 24% is exact.
+- **Q2 (query): batch threshold 1024 -> 262144.** Fixes the 0.3.2 regression where per-call thread spawn made moderate-batch `lookup()` 1.4x-63x slower than serial. Moderate batches are now serial/fast; parallel only above ~256K.
+- **Q1 (query): `PHF.lookup_fixed(arr)` numpy bulk path**, up to ~16x faster than `lookup(list)` for large buffer-native batches (9 ns/key at 1M) by skipping per-key Python objects. Additive, optional numpy, C stays numpy-free.
+
+Measured-but-NOT-shipped (the study's negatives, recorded on the
+`experiments/0.4.0-efficiency` branch): B2 (parallel shard partition) was correct
+and deterministic but only ~5% end-to-end once measured cleanly (a load-inflated
+profile made it look like 8.7x; the back-to-back A/B corrected it) and cost +40MB
+transient memory, so it was dropped. B1/B3 (build micro-opts) and entropy-coded
+pilots (more space, but a per-query decode) were deferred. S1 found the
+shard/bucket schedule is a free Pareto knob and PHF4 flattens its space cost
+(bpk spread across shard sizes 27% -> 5%), validating the 16K-keys/shard default.
+
+What 0.4.0 did NOT change: the public type/function surface (`PHF`, `build`,
+`from_bytes`, plus the additive `lookup_fixed`); build determinism (same `seed`
+-> byte-identical `to_bytes()` across machines and thread counts); the always-
+strict and load_factor semantics.
+
+---
+
+### 0.3.2 (previous)
+
+0.3.2 integrated two parallel review efforts: commit `4248043` (the
 lookup-default-parallelism fix, the deserialize `s_poff` overflow fix, the
 empty-shard guard, the `_encode_keys` dedup, dead-code removal) and the
 remaining hardening below. The combined change set:

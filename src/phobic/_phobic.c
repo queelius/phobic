@@ -11,11 +11,20 @@
 #define PHOBIC_HAVE_PTHREAD 0
 #endif
 
-/* Wire format v3 fixed sizes (see phobic_serialize). Defined up front so the
- * single layout walk (v3_layout) can be shared by serialized_size and
- * phobic_serialize, keeping the size-vs-write contract from drifting. */
-#define V3_GLOBAL_HEADER_SIZE  56u
-#define V3_SHARD_DESC_SIZE     40u
+/* Wire format v4 fixed sizes (see phobic_serialize). Defined up front so the
+ * single layout walk (wire_layout) can be shared by serialized_size and
+ * phobic_serialize, keeping the size-vs-write contract from drifting.
+ * v4 adds a per-shard pilot_bits field to the descriptor (40 -> 48): pilots
+ * are bit-packed at the minimum fixed width per shard instead of uint16. */
+#define WIRE_GLOBAL_HEADER_SIZE  56u
+#define WIRE_SHARD_DESC_SIZE     48u
+/* 8 bytes of tail padding so a 3-byte unaligned read of the last packed
+ * pilot field never runs past the buffer. */
+#define WIRE_TAIL_PAD            8u
+
+static inline unsigned bitlen_u64(uint64_t x) {
+    unsigned n = 0; while (x) { n++; x >>= 1; } return n;
+}
 
 #ifdef PHOBIC_PROFILE
 #include <time.h>
@@ -122,25 +131,42 @@ void phobic_free(phobic_phf *phf) {
     free(phf);
 }
 
-/* Single walk of the wire-format v3 layout: 56-byte global header + 40-byte
- * per-shard descriptors + 8-byte-aligned uint16 pilot blocks. Returns the
- * total padded size; if pilot_off is non-NULL, writes each shard's absolute
- * 8-byte-aligned pilot-block offset into pilot_off[s]. serialized_size and
- * phobic_serialize both go through this so the size computation and the write
- * offsets can never disagree. */
-static size_t v3_layout(const phobic_phf *phf, size_t *pilot_off) {
-    size_t off = V3_GLOBAL_HEADER_SIZE + V3_SHARD_DESC_SIZE * phf->num_shards;
+/* Minimum fixed bit width to store every pilot in shard s. Empty shard -> 0.
+ * Width 0 would make an all-zero-pilot shard pack to nothing; clamp to 1 so
+ * each bucket still occupies a (zero) slot the reader can address. */
+static unsigned shard_pilot_bits(const phobic_phf *phf, size_t s) {
+    size_t nb = phf->shard_num_buckets[s];
+    if (nb == 0) return 0;
+    uint16_t mx = 0;
+    const uint16_t *p = phf->shard_pilots[s];
+    for (size_t b = 0; b < nb; b++) if (p[b] > mx) mx = p[b];
+    unsigned w = bitlen_u64(mx);
+    return w == 0 ? 1 : w;
+}
+
+/* Single walk of the wire-format v4 layout: 56-byte global header + 48-byte
+ * per-shard descriptors + 8-byte-aligned bit-packed pilot blocks (each shard's
+ * pilots stored at shard_pilot_bits() fixed width), + 8 tail-pad bytes.
+ * Returns the total padded size; if pilot_off/pilot_bits are non-NULL, fills
+ * them per shard. serialized_size and phobic_serialize both go through this so
+ * the size computation and the write offsets can never disagree. */
+static size_t wire_layout(const phobic_phf *phf, size_t *pilot_off,
+                          unsigned *pilot_bits) {
+    size_t off = WIRE_GLOBAL_HEADER_SIZE + WIRE_SHARD_DESC_SIZE * phf->num_shards;
     off = (off + 7) & ~(size_t)7;  /* align before first pilot block */
     for (size_t s = 0; s < phf->num_shards; s++) {
-        if (pilot_off) pilot_off[s] = off;
-        off += phf->shard_num_buckets[s] * sizeof(uint16_t);
+        unsigned w = shard_pilot_bits(phf, s);
+        if (pilot_off)  pilot_off[s]  = off;
+        if (pilot_bits) pilot_bits[s] = w;
+        size_t block_bytes = (phf->shard_num_buckets[s] * (size_t)w + 7) / 8;
+        off += block_bytes;
         if (s + 1 < phf->num_shards) off = (off + 7) & ~(size_t)7;
     }
-    return off;
+    return off + WIRE_TAIL_PAD;
 }
 
 static size_t serialized_size(const phobic_phf *phf) {
-    return v3_layout(phf, NULL);
+    return wire_layout(phf, NULL, NULL);
 }
 
 double phobic_bits_per_key(const phobic_phf *phf) {
@@ -801,10 +827,13 @@ static void *batch_worker(void *arg) {
 }
 #endif
 
-/* Threading threshold: pthread_create + join overhead (~10-50 us)
- * starts to amortise around N keys * per-key cost. At ~500 ns per query
- * this is ~1024 keys; below that, serial is faster. Phase 5 may tune. */
-#define PHOBIC_BATCH_THREADING_THRESHOLD ((size_t)1024)
+/* Threading threshold. Empirically (0.4.0 study, .claude/EXPERIMENTS_0_4_0.md),
+ * per-call pthread_create x N + join + GIL cycling costs hundreds of us, which
+ * dwarfs the ~100 ns/key query work until the batch is very large. The old
+ * 1024 threshold made moderate batches (1K-64K) 1.4x-63x SLOWER than serial.
+ * Parallel only reliably wins past ~256K keys (and only marginally without a
+ * persistent thread pool), so the threshold is set there. */
+#define PHOBIC_BATCH_THREADING_THRESHOLD ((size_t)262144)
 
 void phobic_query_batch(const phobic_phf *phf,
                          const char **keys,
@@ -878,10 +907,74 @@ serial:
         out_slots[i] = phobic_query(phf, keys[i], key_lens[i]);
 }
 
-/* ── serialization (wire format v3) ───────────────────────────────────── */
+/* ── fixed-width batch query (numpy bulk path) ───────────────────────── */
 
-#define PHOBIC_MAGIC_V3 ((uint32_t)0x33464850) /* little-endian: wire bytes 0x50 0x48 0x46 0x33 = "PHF3" */
-#define PHOBIC_VERSION  ((uint32_t)3)
+#if PHOBIC_HAVE_PTHREAD
+typedef struct {
+    const phobic_phf *phf;
+    const uint8_t *keys;
+    size_t width;
+    uint64_t *out;
+    size_t start, end;
+} fixed_chunk;
+
+static void *fixed_worker(void *arg) {
+    fixed_chunk *c = (fixed_chunk *)arg;
+    for (size_t i = c->start; i < c->end; i++)
+        c->out[i] = phobic_query(c->phf,
+                                 (const char *)(c->keys + i * c->width), c->width);
+    return NULL;
+}
+#endif
+
+void phobic_query_fixed_batch(const phobic_phf *phf, const uint8_t *keys,
+                              size_t width, size_t n, uint64_t *out,
+                              int num_threads) {
+    if (num_threads <= 0) {
+        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = cpu > 1 ? (int)cpu : 1;
+    }
+#if PHOBIC_HAVE_PTHREAD
+    if (num_threads > 1 && n >= PHOBIC_BATCH_THREADING_THRESHOLD) {
+        if ((size_t)num_threads > n) num_threads = (int)n;
+        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
+        fixed_chunk *chunks = malloc((size_t)num_threads * sizeof(fixed_chunk));
+        if (!threads || !chunks) { free(threads); free(chunks); goto serial; }
+        size_t per = n / (size_t)num_threads;
+        size_t rem = n % (size_t)num_threads;
+        size_t cursor = 0;
+        int spawned = 0;
+        for (int t = 0; t < num_threads; t++) {
+            size_t this_chunk = per + ((size_t)t < rem ? 1 : 0);
+            chunks[t] = (fixed_chunk){phf, keys, width, out, cursor, cursor + this_chunk};
+            cursor += this_chunk;
+            if (pthread_create(&threads[t], NULL, fixed_worker, &chunks[t]) == 0) {
+                spawned++;
+            } else {
+                fixed_worker(&chunks[t]);
+                for (int u = t + 1; u < num_threads; u++) {
+                    size_t uc = per + ((size_t)u < rem ? 1 : 0);
+                    chunks[u] = (fixed_chunk){phf, keys, width, out, cursor, cursor + uc};
+                    cursor += uc;
+                    fixed_worker(&chunks[u]);
+                }
+                break;
+            }
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+        free(threads); free(chunks);
+        return;
+    }
+serial:
+#endif
+    for (size_t i = 0; i < n; i++)
+        out[i] = phobic_query(phf, (const char *)(keys + i * width), width);
+}
+
+/* ── serialization (wire format v4) ───────────────────────────────────── */
+
+#define PHOBIC_MAGIC_V4 ((uint32_t)0x34464850) /* little-endian: wire bytes 0x50 0x48 0x46 0x34 = "PHF4" */
+#define PHOBIC_VERSION  ((uint32_t)4)
 
 static inline void write_u16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
 static inline uint16_t read_u16(const uint8_t *p) {
@@ -901,25 +994,49 @@ static inline uint64_t read_u64(const uint8_t *p) {
     return (uint64_t)read_u32(p) | ((uint64_t)read_u32(p+4)<<32);
 }
 
+/* LSB-first fixed-width bit packing for pilots (width <= 16). The buffer is
+ * zero-filled before packing, so write ORs set bits. read assembles 3 bytes
+ * (covers width<=16 at any bit offset <=7); the WIRE_TAIL_PAD bytes guarantee
+ * the 3-byte read of the final field stays in-bounds. */
+static inline void write_bits_le(uint8_t *base, size_t bit_off,
+                                 unsigned width, uint32_t val) {
+    for (unsigned i = 0; i < width; i++)
+        if ((val >> i) & 1u)
+            base[(bit_off + i) >> 3] |= (uint8_t)(1u << ((bit_off + i) & 7));
+}
+static inline uint32_t read_bits_le(const uint8_t *base, size_t bit_off,
+                                    unsigned width) {
+    size_t byte = bit_off >> 3;
+    unsigned sh = (unsigned)(bit_off & 7);
+    uint32_t v = (uint32_t)base[byte]
+               | ((uint32_t)base[byte + 1] << 8)
+               | ((uint32_t)base[byte + 2] << 16);
+    uint32_t mask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+    return (v >> sh) & mask;
+}
+
 size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     if (!phf) return 0;
     size_t total = serialized_size(phf);
     if (!buf) return total;
     if (buf_len < total) return 0;
 
-    size_t descriptors_off = V3_GLOBAL_HEADER_SIZE;
+    size_t descriptors_off = WIRE_GLOBAL_HEADER_SIZE;
 
-    /* Pilot-block offsets, from the same layout walk serialized_size used. */
+    /* Pilot-block offsets and per-shard bit widths, from the same layout walk
+     * serialized_size used (so size and write offsets cannot disagree). */
     size_t *pilot_off = malloc(phf->num_shards * sizeof(size_t));
-    if (!pilot_off) return 0;
-    v3_layout(phf, pilot_off);
+    unsigned *pilot_bits = malloc(phf->num_shards * sizeof(unsigned));
+    if (!pilot_off || !pilot_bits) { free(pilot_off); free(pilot_bits); return 0; }
+    wire_layout(phf, pilot_off, pilot_bits);
 
-    /* Zero-fill the buffer first (cheap; covers all alignment padding). */
+    /* Zero-fill the buffer first (cheap; covers padding and lets the bit
+     * packer OR set bits into clean storage). */
     memset(buf, 0, total);
 
     /* Global header. */
     uint8_t *p = buf;
-    write_u32(p, PHOBIC_MAGIC_V3);    p += 4;
+    write_u32(p, PHOBIC_MAGIC_V4);    p += 4;
     write_u32(p, PHOBIC_VERSION);     p += 4;
     write_u64(p, (uint64_t)phf->num_keys);     p += 8;
     write_u64(p, (uint64_t)phf->total_range);  p += 8;
@@ -928,31 +1045,34 @@ size_t phobic_serialize(const phobic_phf *phf, uint8_t *buf, size_t buf_len) {
     write_u64(p, phf->shard_seed);             p += 8;
     write_u64(p, 0);                           p += 8;  /* reserved */
 
-    /* Shard descriptors. */
+    /* Shard descriptors (48 bytes: + pilot_bits vs v3). */
     for (size_t s = 0; s < phf->num_shards; s++) {
-        uint8_t *d = buf + descriptors_off + V3_SHARD_DESC_SIZE * s;
+        uint8_t *d = buf + descriptors_off + WIRE_SHARD_DESC_SIZE * s;
         write_u64(d +  0, phf->shard_seeds[s]);
         write_u64(d +  8, (uint64_t)phf->shard_bucket_size[s]);
         write_u64(d + 16, (uint64_t)phf->shard_num_buckets[s]);
         write_u64(d + 24, (uint64_t)phf->shard_range[s]);
-        write_u64(d + 32, (uint64_t)pilot_off[s]);
+        write_u64(d + 32, (uint64_t)pilot_bits[s]);
+        write_u64(d + 40, (uint64_t)pilot_off[s]);
     }
 
-    /* Pilot blocks. */
+    /* Pilot blocks: bit-packed at pilot_bits[s] fixed width per shard. */
     for (size_t s = 0; s < phf->num_shards; s++) {
         uint8_t *d = buf + pilot_off[s];
+        unsigned w = pilot_bits[s];
         for (size_t b = 0; b < phf->shard_num_buckets[s]; b++)
-            write_u16(d + b * 2, phf->shard_pilots[s][b]);
+            write_bits_le(d, b * (size_t)w, w, phf->shard_pilots[s][b]);
     }
 
     free(pilot_off);
+    free(pilot_bits);
     return total;
 }
 
 phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
-    if (!buf || buf_len < V3_GLOBAL_HEADER_SIZE) return NULL;
+    if (!buf || buf_len < WIRE_GLOBAL_HEADER_SIZE) return NULL;
 
-    if (read_u32(buf + 0) != PHOBIC_MAGIC_V3) return NULL;
+    if (read_u32(buf + 0) != PHOBIC_MAGIC_V4) return NULL;
     if (read_u32(buf + 4) != PHOBIC_VERSION) return NULL;
 
     uint64_t num_keys     = read_u64(buf +  8);
@@ -962,8 +1082,8 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
     uint64_t shard_seed   = read_u64(buf + 40);
 
     if (num_shards == 0) return NULL;
-    if (num_shards > (SIZE_MAX - V3_GLOBAL_HEADER_SIZE) / V3_SHARD_DESC_SIZE) return NULL;
-    size_t descriptors_end = V3_GLOBAL_HEADER_SIZE + V3_SHARD_DESC_SIZE * num_shards;
+    if (num_shards > (SIZE_MAX - WIRE_GLOBAL_HEADER_SIZE) / WIRE_SHARD_DESC_SIZE) return NULL;
+    size_t descriptors_end = WIRE_GLOBAL_HEADER_SIZE + WIRE_SHARD_DESC_SIZE * num_shards;
     if (buf_len < descriptors_end) return NULL;
 
     phobic_phf *phf = calloc(1, sizeof(phobic_phf));
@@ -988,19 +1108,23 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
 
     size_t cumulative = 0;
     for (size_t s = 0; s < (size_t)num_shards; s++) {
-        const uint8_t *d = buf + V3_GLOBAL_HEADER_SIZE + V3_SHARD_DESC_SIZE * s;
+        const uint8_t *d = buf + WIRE_GLOBAL_HEADER_SIZE + WIRE_SHARD_DESC_SIZE * s;
         uint64_t s_seed   = read_u64(d +  0);
         uint64_t s_bsize  = read_u64(d +  8);
         uint64_t s_nbck   = read_u64(d + 16);
         uint64_t s_range  = read_u64(d + 24);
-        uint64_t s_poff   = read_u64(d + 32);
+        uint64_t s_pbits  = read_u64(d + 32);
+        uint64_t s_poff   = read_u64(d + 40);
 
-        /* Shard shape consistency: a genuinely empty shard has BOTH zero
-         * buckets and zero range; a populated shard has both positive. Any
-         * other combination is corrupt and would divide by zero at query time
-         * (bucket_for does h1 % num_buckets, slot_with_pilot does mixed % range).
-         * Reject rather than accept-then-crash-on-query. */
+        /* Shard shape consistency: a genuinely empty shard has zero buckets,
+         * zero range, AND zero pilot_bits; a populated shard has all three
+         * positive. Any other combination is corrupt and would divide by zero
+         * at query time (bucket_for: h1 % num_buckets, slot_with_pilot:
+         * mixed % range). Reject rather than accept-then-crash-on-query. */
         if ((s_nbck == 0) != (s_range == 0)) { phobic_free(phf); return NULL; }
+        if ((s_nbck == 0) != (s_pbits == 0)) { phobic_free(phf); return NULL; }
+        /* Pilots are uint16, so a packed width above 16 cannot be right. */
+        if (s_pbits > 16) { phobic_free(phf); return NULL; }
 
         /* Overflow-guard the running range sum so the cumulative == total_range
          * check below is meaningful rather than satisfiable by wraparound. */
@@ -1018,22 +1142,23 @@ phobic_phf *phobic_deserialize(const uint8_t *buf, size_t buf_len) {
             continue;
         }
 
-        /* Validate offset and length fit in the buffer. */
+        /* Validate the packed pilot block fits in the buffer. block_bytes =
+         * ceil(num_buckets * pilot_bits / 8); read_bits_le touches up to 2
+         * bytes past the byte holding a field's first bit, hence the +2. */
         if (s_poff < descriptors_end) { phobic_free(phf); return NULL; }
         if ((s_poff & 7) != 0) { phobic_free(phf); return NULL; }
-        if (s_nbck > SIZE_MAX / sizeof(uint16_t)) { phobic_free(phf); return NULL; }
-        size_t pilot_bytes = (size_t)s_nbck * sizeof(uint16_t);
-        /* s_poff + pilot_bytes can overflow uint64 on a hostile blob and
-         * wrap past the bound; check without adding (s_poff is untrusted). */
-        if (s_poff > buf_len || pilot_bytes > buf_len - s_poff) {
+        if (s_nbck > (SIZE_MAX - 7) / 16) { phobic_free(phf); return NULL; }
+        size_t block_bytes = ((size_t)s_nbck * (size_t)s_pbits + 7) / 8;
+        if (s_poff > buf_len || block_bytes + 2 > buf_len - s_poff) {
             phobic_free(phf); return NULL;
         }
 
-        uint16_t *pilots = malloc(pilot_bytes);
+        uint16_t *pilots = malloc((size_t)s_nbck * sizeof(uint16_t));
         if (!pilots) { phobic_free(phf); return NULL; }
         const uint8_t *src = buf + s_poff;
+        unsigned w = (unsigned)s_pbits;
         for (size_t b = 0; b < (size_t)s_nbck; b++)
-            pilots[b] = read_u16(src + b * 2);
+            pilots[b] = (uint16_t)read_bits_le(src, b * (size_t)w, w);
         phf->shard_pilots[s] = pilots;
     }
 

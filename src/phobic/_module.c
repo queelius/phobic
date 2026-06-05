@@ -15,7 +15,7 @@ static inline double pp_now(void) {
             (label), (pp_now() - (t0)) * 1000.0)
 #endif
 
-/* phobic 0.3.2 Python C extension.
+/* phobic 0.4.0 Python C extension.
  *
  * Public surface (called from phobic/__init__.py):
  *   build(keys, load_factor, seed, max_retries, bucket_size, num_shards, num_threads)
@@ -244,6 +244,53 @@ static PyObject *py_query_batch(PyObject *self, PyObject *args) {
     return result;
 }
 
+/* Fixed-width bulk query. keys is any contiguous buffer (e.g. a numpy
+ * (n, width) uint8 array, or bytes) of n*width bytes; returns a bytes object
+ * of n*8 holding host-endian uint64 slots, which the Python wrapper views as
+ * a numpy uint64 array. Uses only the buffer protocol (no numpy linkage), so
+ * numpy stays an optional runtime dependency. Skips all per-key Python objects:
+ * no PyBytes list on input, no PyLong list on output. */
+static PyObject *py_query_batch_fixed(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    Py_buffer keys;
+    Py_ssize_t width;
+    int num_threads;
+
+    if (!PyArg_ParseTuple(args, "Oy*ni", &capsule, &keys, &width, &num_threads))
+        return NULL;
+
+    phobic_phf *phf = (phobic_phf *)PyCapsule_GetPointer(capsule, "phobic_phf");
+    if (!phf) { PyBuffer_Release(&keys); return NULL; }
+
+    if (width <= 0) {
+        PyBuffer_Release(&keys);
+        PyErr_SetString(PyExc_ValueError, "width must be >= 1");
+        return NULL;
+    }
+    if (keys.len % width != 0) {
+        PyBuffer_Release(&keys);
+        PyErr_SetString(PyExc_ValueError, "key buffer length is not a multiple of width");
+        return NULL;
+    }
+    size_t n = (size_t)keys.len / (size_t)width;
+
+    PyObject *out = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)(n * sizeof(uint64_t)));
+    if (!out) { PyBuffer_Release(&keys); return NULL; }
+    uint64_t *out_slots = (uint64_t *)PyBytes_AS_STRING(out);
+
+    /* keys.buf is pinned by the Py_buffer; out is a fresh, unshared bytes whose
+     * storage we fill before returning. Both are safe to touch with the GIL
+     * released, as long as no Python C-API is called in the window. */
+    Py_BEGIN_ALLOW_THREADS
+    phobic_query_fixed_batch(phf, (const uint8_t *)keys.buf, (size_t)width, n,
+                             out_slots, num_threads);
+    Py_END_ALLOW_THREADS
+
+    PyBuffer_Release(&keys);
+    return out;
+}
+
 /* ── serialization ─────────────────────────────────────────────────── */
 
 static PyObject *py_serialize(PyObject *self, PyObject *args) {
@@ -320,6 +367,8 @@ static PyMethodDef module_methods[] = {
     {"build",        py_build,        METH_VARARGS, "Build a PHF from keys"},
     {"query",        py_query,        METH_VARARGS, "Query a PHF for a key's slot"},
     {"query_batch",  py_query_batch,  METH_VARARGS, "Batch query a PHF for many keys"},
+    {"query_batch_fixed", py_query_batch_fixed, METH_VARARGS,
+     "Fixed-width bulk query over a contiguous buffer; returns uint64 bytes"},
     {"serialize",    py_serialize,    METH_VARARGS, "Serialize a PHF to bytes (wire format v3)"},
     {"deserialize",  py_deserialize,  METH_VARARGS, "Deserialize a PHF from bytes"},
     {"num_keys",     py_num_keys,     METH_VARARGS, "Number of keys in the PHF"},

@@ -15,7 +15,8 @@ Public surface
     phobic.PHF        # the only exported type
 
     phf[key]                              # scalar query
-    phf.lookup(keys, num_threads=None)    # batch query
+    phf.lookup(keys, num_threads=None)    # batch query (list of str/bytes)
+    phf.lookup_fixed(arr, num_threads=None)  # bulk query, numpy (N,W) uint8 -> uint64
     phf.to_bytes() -> bytes
     phf.range_size, phf.num_shards, phf.bits_per_key
     len(phf)
@@ -32,6 +33,7 @@ from phobic._module import (
     build       as _c_build,
     query       as _c_query,
     query_batch as _c_query_batch,
+    query_batch_fixed as _c_query_batch_fixed,
     serialize   as _c_serialize,
     deserialize as _c_deserialize,
     num_keys    as _c_num_keys,
@@ -107,6 +109,29 @@ class PHF:
         raw = _encode_keys(keys)
         nt = 0 if num_threads is None else int(num_threads)
         return _c_query_batch(self._handle, raw, nt)
+
+    def lookup_fixed(self, keys, *, num_threads=None):
+        """Bulk query over fixed-width keys, returning a numpy ``uint64`` array.
+
+        ``keys`` is a C-contiguous ``(N, width)`` uint8 numpy array (or any
+        2-D buffer of equal-length rows); row ``i`` is one ``width``-byte key.
+        This skips all per-key Python objects (no bytes list in, no int list
+        out), so it is much faster than ``lookup`` for large batches of
+        uniform-width keys (e.g. cipher-maps' 16-byte HMAC keys). Requires
+        numpy (optional dependency); ``lookup`` remains numpy-free.
+
+        Returns ``numpy.ndarray`` of dtype ``uint64``, shape ``(N,)``.
+        """
+        import numpy as np
+        if num_threads is not None and int(num_threads) < 1:
+            raise ValueError(f"num_threads must be >= 1 or None, got {num_threads}")
+        a = np.ascontiguousarray(keys, dtype=np.uint8)
+        if a.ndim != 2:
+            raise ValueError("keys must be a 2-D (N, width) uint8 array")
+        width = a.shape[1]
+        nt = 0 if num_threads is None else int(num_threads)
+        raw = _c_query_batch_fixed(self._handle, a, width, nt)
+        return np.frombuffer(raw, dtype=np.uint64)
 
     # ── introspection ────────────────────────────────────────────────
 
