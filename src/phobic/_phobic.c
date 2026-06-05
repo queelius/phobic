@@ -466,6 +466,52 @@ static void *build_worker(void *arg) {
         p->result_codes[s] = rc;
     }
 }
+
+/* ── parallel shard partition (B2) ───────────────────────────────────── */
+/* The count and scatter passes that distribute keys to shards were single-
+ * threaded and, at scale, a large fraction of the build (~36% at 10M). These
+ * workers parallelise both over fixed contiguous key ranges. The per-shard
+ * key order is preserved exactly (each thread writes at offsets reserved from
+ * the count pass, in thread-index order), so output is byte-identical to the
+ * serial path and independent of thread count. Each key's shard is computed
+ * once (count pass) and stored in shard_of[], so scatter does not re-hash. */
+typedef struct {
+    const char **keys; const size_t *key_lens;
+    size_t start, end;
+    uint64_t shard_seed; size_t num_shards;
+    uint32_t *shard_of;     /* out: per-key shard id */
+    size_t   *local_hist;   /* out: this thread's per-shard counts */
+} partition_count_arg;
+
+static void *partition_count_worker(void *arg) {
+    partition_count_arg *p = (partition_count_arg *)arg;
+    for (size_t i = p->start; i < p->end; i++) {
+        size_t s = shard_for_key(p->keys[i], p->key_lens[i],
+                                 p->shard_seed, p->num_shards);
+        p->shard_of[i] = (uint32_t)s;
+        p->local_hist[s]++;
+    }
+    return NULL;
+}
+
+typedef struct {
+    const char **keys; const size_t *key_lens;
+    size_t start, end;
+    const uint32_t *shard_of;
+    const char ***shard_keys; size_t **shard_lens;
+    size_t *cursor;   /* this thread's per-shard write cursor, pre-seeded to base */
+} partition_scatter_arg;
+
+static void *partition_scatter_worker(void *arg) {
+    partition_scatter_arg *p = (partition_scatter_arg *)arg;
+    for (size_t i = p->start; i < p->end; i++) {
+        size_t s = p->shard_of[i];
+        size_t pos = p->cursor[s]++;
+        p->shard_keys[s][pos] = p->keys[i];
+        p->shard_lens[s][pos] = p->key_lens[i];
+    }
+    return NULL;
+}
 #endif /* PHOBIC_HAVE_PTHREAD */
 
 /* ── auto num_shards heuristic ───────────────────────────────────────── */
@@ -557,21 +603,71 @@ phobic_phf *phobic_build_with_diag(const char **keys,
             ^ ((uint64_t)s * 0xC2B2AE3D27D4EB4FULL)
             ^ 0x4F1BBCDCBFA53E0BULL);
 
-    /* Distribute keys to shards.
-     * Single-pass: compute shard for each key, build per-shard pointer arrays. */
+    /* Distribute keys to shards. The count and scatter passes are parallelised
+     * (B2) when worthwhile; per-shard key order is preserved exactly so output
+     * is byte-identical to the serial path regardless of thread count. */
     size_t *shard_counts = calloc(num_shards, sizeof(size_t));
     if (!shard_counts) { phobic_free(phf); return NULL; }
+
+    uint32_t *shard_of    = NULL;  /* parallel path: per-key shard id */
+    size_t   *part_cursors = NULL; /* parallel path: per-thread reserved bases */
+    int parallel_part = 0;
 
 #ifdef PHOBIC_PROFILE
     double pp_dist_t0 = pp_now();
 #endif
-    /* If num_shards == 1, every key is in shard 0; skip the hash computation. */
-    if (num_shards == 1) {
-        shard_counts[0] = num_keys;
-    } else {
-        for (size_t i = 0; i < num_keys; i++) {
-            size_t s = shard_for_key(keys[i], key_lens[i], shard_seed, num_shards);
-            shard_counts[s]++;
+#if PHOBIC_HAVE_PTHREAD
+    if (num_shards > 1 && num_threads > 1) {
+        shard_of = malloc(num_keys * sizeof(uint32_t));
+        size_t *local_hist = calloc((size_t)num_threads * num_shards, sizeof(size_t));
+        pthread_t *pth = malloc((size_t)num_threads * sizeof(pthread_t));
+        partition_count_arg *cargs =
+            malloc((size_t)num_threads * sizeof(partition_count_arg));
+        if (shard_of && local_hist && pth && cargs) {
+            size_t per = num_keys / (size_t)num_threads;
+            size_t rem = num_keys % (size_t)num_threads;
+            size_t cur = 0;
+            for (int t = 0; t < num_threads; t++) {
+                size_t cnt = per + ((size_t)t < rem ? 1 : 0);
+                cargs[t] = (partition_count_arg){
+                    keys, key_lens, cur, cur + cnt, shard_seed, num_shards,
+                    shard_of, &local_hist[(size_t)t * num_shards]};
+                cur += cnt;
+            }
+            int spawned = 0;
+            for (int t = 0; t < num_threads; t++) {
+                if (pthread_create(&pth[t], NULL, partition_count_worker, &cargs[t]) == 0)
+                    spawned++;
+                else { for (int u = t; u < num_threads; u++) partition_count_worker(&cargs[u]); break; }
+            }
+            for (int t = 0; t < spawned; t++) pthread_join(pth[t], NULL);
+
+            /* Merge per-thread histograms into shard_counts and reserve a
+             * per-(thread,shard) base so the scatter preserves input order. */
+            part_cursors = malloc((size_t)num_threads * num_shards * sizeof(size_t));
+            if (part_cursors) {
+                for (size_t s = 0; s < num_shards; s++) {
+                    size_t base = 0;
+                    for (int t = 0; t < num_threads; t++) {
+                        part_cursors[(size_t)t * num_shards + s] = base;
+                        base += local_hist[(size_t)t * num_shards + s];
+                    }
+                    shard_counts[s] = base;
+                }
+                parallel_part = 1;
+            }
+        }
+        free(local_hist); free(pth); free(cargs);
+        if (!parallel_part) { free(shard_of); shard_of = NULL;
+                              free(part_cursors); part_cursors = NULL; }
+    }
+#endif
+    if (!parallel_part) {
+        if (num_shards == 1) {
+            shard_counts[0] = num_keys;
+        } else {
+            for (size_t i = 0; i < num_keys; i++)
+                shard_counts[shard_for_key(keys[i], key_lens[i], shard_seed, num_shards)]++;
         }
     }
 #ifdef PHOBIC_PROFILE
@@ -582,6 +678,7 @@ phobic_phf *phobic_build_with_diag(const char **keys,
     const char ***shard_keys = calloc(num_shards, sizeof(const char **));
     size_t **shard_lens = calloc(num_shards, sizeof(size_t *));
     if (!shard_keys || !shard_lens) {
+        free(shard_of); free(part_cursors);
         free(shard_counts); free(shard_keys); free(shard_lens);
         phobic_free(phf);
         return NULL;
@@ -595,39 +692,68 @@ phobic_phf *phobic_build_with_diag(const char **keys,
                 free(shard_keys[t]);
                 free(shard_lens[t]);
             }
+            free(shard_of); free(part_cursors);
             free(shard_keys); free(shard_lens); free(shard_counts);
             phobic_free(phf);
             return NULL;
         }
     }
 
-    /* Scatter pointers/lens into per-shard arrays. */
-    size_t *write_pos = calloc(num_shards, sizeof(size_t));
-    if (!write_pos) {
-        for (size_t s = 0; s < num_shards; s++) {
-            free(shard_keys[s]); free(shard_lens[s]);
-        }
-        free(shard_keys); free(shard_lens); free(shard_counts);
-        phobic_free(phf);
-        return NULL;
-    }
 #ifdef PHOBIC_PROFILE
     double pp_scatter_t0 = pp_now();
 #endif
-    if (num_shards == 1) {
-        for (size_t i = 0; i < num_keys; i++) {
-            shard_keys[0][i] = keys[i];
-            shard_lens[0][i] = key_lens[i];
+    /* Scatter pointers/lens into per-shard arrays. */
+    int scattered = 0;
+#if PHOBIC_HAVE_PTHREAD
+    if (parallel_part) {
+        pthread_t *pth = malloc((size_t)num_threads * sizeof(pthread_t));
+        partition_scatter_arg *sargs =
+            malloc((size_t)num_threads * sizeof(partition_scatter_arg));
+        if (pth && sargs) {
+            size_t per = num_keys / (size_t)num_threads;
+            size_t rem = num_keys % (size_t)num_threads;
+            size_t cur = 0;
+            for (int t = 0; t < num_threads; t++) {
+                size_t cnt = per + ((size_t)t < rem ? 1 : 0);
+                sargs[t] = (partition_scatter_arg){
+                    keys, key_lens, cur, cur + cnt, shard_of,
+                    shard_keys, shard_lens, &part_cursors[(size_t)t * num_shards]};
+                cur += cnt;
+            }
+            int spawned = 0;
+            for (int t = 0; t < num_threads; t++) {
+                if (pthread_create(&pth[t], NULL, partition_scatter_worker, &sargs[t]) == 0)
+                    spawned++;
+                else { for (int u = t; u < num_threads; u++) partition_scatter_worker(&sargs[u]); break; }
+            }
+            for (int t = 0; t < spawned; t++) pthread_join(pth[t], NULL);
+            scattered = 1;
         }
-    } else {
+        free(pth); free(sargs);
+    }
+#endif
+    if (!scattered) {
+        /* Serial scatter. Use shard_of when the parallel count populated it
+         * (no re-hash); otherwise recompute the shard. Input order either way. */
+        size_t *write_pos = calloc(num_shards, sizeof(size_t));
+        if (!write_pos) {
+            free(shard_of); free(part_cursors);
+            for (size_t s = 0; s < num_shards; s++) { free(shard_keys[s]); free(shard_lens[s]); }
+            free(shard_keys); free(shard_lens); free(shard_counts);
+            phobic_free(phf);
+            return NULL;
+        }
         for (size_t i = 0; i < num_keys; i++) {
-            size_t s = shard_for_key(keys[i], key_lens[i], shard_seed, num_shards);
+            size_t s = shard_of ? (size_t)shard_of[i]
+                     : (num_shards == 1 ? 0
+                        : shard_for_key(keys[i], key_lens[i], shard_seed, num_shards));
             shard_keys[s][write_pos[s]] = keys[i];
             shard_lens[s][write_pos[s]] = key_lens[i];
             write_pos[s]++;
         }
+        free(write_pos);
     }
-    free(write_pos);
+    free(shard_of); free(part_cursors);
 #ifdef PHOBIC_PROFILE
     PP_REPORT("shard scatter pass", pp_scatter_t0);
     double pp_build_t0 = pp_now();
