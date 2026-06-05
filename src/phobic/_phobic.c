@@ -1033,6 +1033,70 @@ serial:
         out_slots[i] = phobic_query(phf, keys[i], key_lens[i]);
 }
 
+/* ── fixed-width batch query (numpy bulk path) ───────────────────────── */
+
+#if PHOBIC_HAVE_PTHREAD
+typedef struct {
+    const phobic_phf *phf;
+    const uint8_t *keys;
+    size_t width;
+    uint64_t *out;
+    size_t start, end;
+} fixed_chunk;
+
+static void *fixed_worker(void *arg) {
+    fixed_chunk *c = (fixed_chunk *)arg;
+    for (size_t i = c->start; i < c->end; i++)
+        c->out[i] = phobic_query(c->phf,
+                                 (const char *)(c->keys + i * c->width), c->width);
+    return NULL;
+}
+#endif
+
+void phobic_query_fixed_batch(const phobic_phf *phf, const uint8_t *keys,
+                              size_t width, size_t n, uint64_t *out,
+                              int num_threads) {
+    if (num_threads <= 0) {
+        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = cpu > 1 ? (int)cpu : 1;
+    }
+#if PHOBIC_HAVE_PTHREAD
+    if (num_threads > 1 && n >= PHOBIC_BATCH_THREADING_THRESHOLD) {
+        if ((size_t)num_threads > n) num_threads = (int)n;
+        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
+        fixed_chunk *chunks = malloc((size_t)num_threads * sizeof(fixed_chunk));
+        if (!threads || !chunks) { free(threads); free(chunks); goto serial; }
+        size_t per = n / (size_t)num_threads;
+        size_t rem = n % (size_t)num_threads;
+        size_t cursor = 0;
+        int spawned = 0;
+        for (int t = 0; t < num_threads; t++) {
+            size_t this_chunk = per + ((size_t)t < rem ? 1 : 0);
+            chunks[t] = (fixed_chunk){phf, keys, width, out, cursor, cursor + this_chunk};
+            cursor += this_chunk;
+            if (pthread_create(&threads[t], NULL, fixed_worker, &chunks[t]) == 0) {
+                spawned++;
+            } else {
+                fixed_worker(&chunks[t]);
+                for (int u = t + 1; u < num_threads; u++) {
+                    size_t uc = per + ((size_t)u < rem ? 1 : 0);
+                    chunks[u] = (fixed_chunk){phf, keys, width, out, cursor, cursor + uc};
+                    cursor += uc;
+                    fixed_worker(&chunks[u]);
+                }
+                break;
+            }
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+        free(threads); free(chunks);
+        return;
+    }
+serial:
+#endif
+    for (size_t i = 0; i < n; i++)
+        out[i] = phobic_query(phf, (const char *)(keys + i * width), width);
+}
+
 /* ── serialization (wire format v4) ───────────────────────────────────── */
 
 #define PHOBIC_MAGIC_V4 ((uint32_t)0x34464850) /* little-endian: wire bytes 0x50 0x48 0x46 0x34 = "PHF4" */

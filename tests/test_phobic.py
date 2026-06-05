@@ -531,6 +531,29 @@ def test_lookup_default_threads_matches_scalar_large_batch():
     assert phf.lookup(keys) == [phf[k] for k in keys]
 
 
+def test_lookup_fixed_matches_scalar():
+    """The numpy fixed-width bulk path returns the same slots as scalar/list
+    query, as a uint64 ndarray of the right shape."""
+    np = pytest.importorskip("numpy")
+    keys = [f"k{i:013d}".encode() for i in range(5000)]  # all 14 bytes
+    phf = phobic.build(keys, seed=2)
+    arr = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(len(keys), 14)
+    fx = phf.lookup_fixed(arr)
+    assert fx.dtype == np.uint64 and fx.shape == (len(keys),)
+    assert list(fx) == [phf[k] for k in keys]
+    assert list(fx) == phf.lookup(keys)
+
+
+def test_lookup_fixed_validates_shape_and_threads():
+    np = pytest.importorskip("numpy")
+    phf = phobic.build([b"aa", b"bb", b"cc"], seed=0)
+    with pytest.raises(ValueError):  # 1-D, not (N, width)
+        phf.lookup_fixed(np.zeros(6, dtype=np.uint8))
+    arr = np.frombuffer(b"aabbcc", dtype=np.uint8).reshape(3, 2)
+    with pytest.raises(ValueError, match="num_threads"):
+        phf.lookup_fixed(arr, num_threads=0)
+
+
 def test_build_and_lookup_accept_bytes_subclass():
     """A bytes subclass works as a key through both build() and lookup():
     the shared key-encoding helper passes such instances straight to C."""

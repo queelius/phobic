@@ -140,7 +140,30 @@ branch as a measured negative; not recommended for the 0.4.0 merge.
 Lesson: back-to-back A/B beats single-run profiles on a loaded machine. The
 space (S3) and query-ratio (Q2) wins are timing-independent and unaffected.
 
-### B1 / B3 / Q1: not pursued (rationale)
+### Q1: numpy bulk query path (SHIP, query win)
+
+`lookup_fixed(arr)` takes a contiguous `(N, width)` uint8 buffer and returns a
+`uint64` numpy array, skipping all per-key Python objects (no bytes list in, no
+int list out). The C extension uses only the buffer protocol (no numpy linkage),
+so numpy stays an optional runtime dependency; `lookup`/`build` are unchanged and
+numpy-free. Determinism/perfectness unaffected (it routes to the same
+`phobic_query`). 71 tests pass.
+
+Measured vs `lookup(list)` on 16-byte keys (ratio, noise-robust):
+
+| batch | lookup(list) | lookup_fixed (array ready) | speedup |
+|---:|---:|---:|---:|
+| 1K | 125 ns/key | 53 | 2.4x |
+| 100K | 112 | 28 | 3.9x |
+| 1M | 122-141 | 9 | **13-16x** |
+
+Honest caveat: the 16x assumes keys are already in a buffer (the natural
+bulk/numpy or cipher-maps key-generation workflow). Converting a Python
+list-of-bytes to the array (`b"".join` + `frombuffer`) costs ~90 ns/key, so from
+a list the end-to-end win is ~1.4x. Highest value for callers that produce keys
+in bulk; still additive and free for everyone else.
+
+### B1 / B3: not pursued (rationale)
 
 Given B2's modest result and the pilot search dominating an already-parallel
 build, further build micro-opts are low-confidence on this noisy machine:
@@ -148,9 +171,6 @@ build, further build micro-opts are low-confidence on this noisy machine:
   section; not isolated, likely small.
 - B3 (pilot-search inner loop): the search IS the core algorithm; micro-opts
   uncertain.
-- Q1 (numpy bulk query): genuine value for huge-batch users (skips per-key
-  PyObject overhead), but additive API scope and Q2 already fixed the common
-  moderate-batch case. Deferred as future additive work.
 
 ### S1: shard/bucket schedule knob (SHIP as policy, not yet implemented)
 
@@ -167,6 +187,7 @@ smaller bpk at +35% build. Pure Python/schedule change.
   0.3.2 regression)**. Both are large, robust, low-risk. Together: ~24% smaller
   output and much faster moderate-batch lookups, build/query otherwise unchanged,
   determinism preserved. Wire format breaks PHF3 -> PHF4 (document in MIGRATION).
+- **SHIP: Q1 (numpy `lookup_fixed`, up to 16x bulk query)**: additive, optional
+  numpy, C stays numpy-free. Big win for buffer-native / bulk-key callers.
 - **OPTIONAL: S1 schedule knob** (free, additive).
-- **DEFER: B2** (correct but ~5%, +40MB), **B1/B3** (low-confidence),
-  **Q1 numpy** (additive future work).
+- **DEFER: B2** (correct but ~5%, +40MB), **B1/B3** (low-confidence).

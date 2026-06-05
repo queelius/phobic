@@ -95,6 +95,17 @@ void phobic_query_batch(const phobic_phf *phf,
                          size_t *out_slots,
                          int num_threads);
 
+/* Fixed-width batch query. `keys` is a contiguous buffer of n rows, each
+ * `width` bytes (row i is keys[i*width .. i*width+width)). out[i] receives
+ * row i's slot. Same threading policy as phobic_query_batch. Lets a caller
+ * (e.g. the numpy path) avoid per-key Python objects entirely. */
+void phobic_query_fixed_batch(const phobic_phf *phf,
+                              const uint8_t *keys,
+                              size_t width,
+                              size_t n,
+                              uint64_t *out,
+                              int num_threads);
+
 void   phobic_free(phobic_phf *phf);
 double phobic_bits_per_key(const phobic_phf *phf);
 
