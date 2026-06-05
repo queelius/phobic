@@ -174,10 +174,26 @@ build, further build micro-opts are low-confidence on this noisy machine:
 
 ### S1: shard/bucket schedule knob (SHIP as policy, not yet implemented)
 
-Phase 1 showed a free Pareto lever (no format change). Recommend exposing an
-`optimize="speed"|"balanced"|"space"` hint (or retuning the default) so callers
+Phase 1 (PHF3) showed a free Pareto lever (no format change). Recommend exposing
+an `optimize="speed"|"balanced"|"space"` hint (or retuning the default) so callers
 can pick a point: e.g. 8K/shard ~34% faster build at +9% bpk; 32K/shard ~7%
 smaller bpk at +35% build. Pure Python/schedule change.
+
+**S1 re-run under PHF4 (S3 changes this tradeoff):** because smaller shards have
+smaller pilots that PHF4 packs tighter, the bpk cost of small (fast-building)
+shards largely vanishes. At 1M:
+
+| keys/shard | bpk PHF3 | bpk PHF4 | spread |
+|---:|---:|---:|---:|
+| 8K | 1.275 | 0.911 | |
+| 16K (default) | 1.165 | 0.884 | |
+| 32K | 1.078 | 0.877 | |
+| 64K | 1.006 | 0.867 | |
+
+The PHF4 bpk spread across shard sizes is only ~5% (vs 27% under PHF3). So the
+16K default is near-optimal on space AND fast, and a "speed" mode (smaller
+shards, more parallelism) now costs almost nothing in space. This validates
+keeping the 16K default; the `optimize=` knob is a nice-to-have, not urgent.
 
 ---
 
