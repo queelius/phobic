@@ -1,3 +1,17 @@
+# 0.4.0 to 0.4.1
+
+A review-driven patch. No wire-format change (PHF4 blobs are unchanged and
+interoperable), no API surface change. One behaviour change to be aware of:
+
+- **`lookup_fixed` now rejects non-uint8 arrays** with `TypeError` instead of
+  silently casting them mod 256. If you were passing an `int`/other-dtype numpy
+  array, you were getting wrong (truncated) slots; pass a `uint8` array of the
+  raw key bytes (e.g. `np.frombuffer(b"".join(keys), np.uint8).reshape(n, w)`).
+- Free: `lookup_fixed` is now 2-4x faster for 32K-256K batches (it parallelises
+  from ~32K instead of ~256K). No code change needed.
+
+---
+
 # Migrating from phobic 0.3.x to 0.4.0
 
 0.4.0 is a space + query efficiency release. The public API is unchanged; the

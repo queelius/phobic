@@ -120,12 +120,19 @@ class PHF:
         uniform-width keys (e.g. cipher-maps' 16-byte HMAC keys). Requires
         numpy (optional dependency); ``lookup`` remains numpy-free.
 
-        Returns ``numpy.ndarray`` of dtype ``uint64``, shape ``(N,)``.
+        Returns a read-only ``numpy.ndarray`` of dtype ``uint64``, shape
+        ``(N,)`` (it views immutable bytes; ``.copy()`` it to mutate).
         """
         import numpy as np
         if num_threads is not None and int(num_threads) < 1:
             raise ValueError(f"num_threads must be >= 1 or None, got {num_threads}")
-        a = np.ascontiguousarray(keys, dtype=np.uint8)
+        a = np.ascontiguousarray(keys)
+        # Require uint8 rather than casting: np.ascontiguousarray(x, dtype=uint8)
+        # would SILENTLY truncate a wider dtype mod 256 (e.g. an int array of key
+        # values), producing wrong, possibly-colliding slots with no error.
+        if a.dtype != np.uint8:
+            raise TypeError(
+                f"keys must be a uint8 array (raw key bytes), got dtype {a.dtype}")
         if a.ndim != 2:
             raise ValueError("keys must be a 2-D (N, width) uint8 array")
         width = a.shape[1]

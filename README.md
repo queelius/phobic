@@ -67,7 +67,7 @@ If a build can't find a perfect hash within `max_retries`, phobic raises a `Runt
 Both the build and `lookup()` release the GIL and fan out across pthreads:
 
 - **Build** parallelism is per-shard. At `num_shards=1` the build is single-threaded; above that it scales nearly linearly to `num_threads`.
-- **Batch query** stays serial below an internal threshold (~256K keys) and chunks across `num_threads` above it. Per-call thread-spawn cost makes serial faster for small and moderate batches; for the fastest bulk path use `lookup_fixed` (numpy).
+- **Batch query** chunks across `num_threads` above an internal threshold, else serial (per-call thread-spawn cost makes serial faster for small batches). The thresholds differ by path: the list `lookup()` parallelises above ~256K keys (per-key Python overhead caps its parallel speedup), while the numpy `lookup_fixed` path parallelises from ~32K (pure C, ~4-5x). For the fastest bulk path use `lookup_fixed`.
 
 Determinism is preserved: same `seed` and same `num_shards` produce byte-identical `to_bytes()` regardless of `num_threads`.
 

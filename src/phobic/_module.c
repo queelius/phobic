@@ -15,7 +15,7 @@ static inline double pp_now(void) {
             (label), (pp_now() - (t0)) * 1000.0)
 #endif
 
-/* phobic 0.4.0 Python C extension.
+/* phobic 0.4.1 Python C extension.
  *
  * Public surface (called from phobic/__init__.py):
  *   build(keys, load_factor, seed, max_retries, bucket_size, num_shards, num_threads)
@@ -369,7 +369,7 @@ static PyMethodDef module_methods[] = {
     {"query_batch",  py_query_batch,  METH_VARARGS, "Batch query a PHF for many keys"},
     {"query_batch_fixed", py_query_batch_fixed, METH_VARARGS,
      "Fixed-width bulk query over a contiguous buffer; returns uint64 bytes"},
-    {"serialize",    py_serialize,    METH_VARARGS, "Serialize a PHF to bytes (wire format v3)"},
+    {"serialize",    py_serialize,    METH_VARARGS, "Serialize a PHF to bytes (wire format v4)"},
     {"deserialize",  py_deserialize,  METH_VARARGS, "Deserialize a PHF from bytes"},
     {"num_keys",     py_num_keys,     METH_VARARGS, "Number of keys in the PHF"},
     {"range_size",   py_range_size,   METH_VARARGS, "Total slot range"},

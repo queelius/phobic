@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* phobic 0.4.0 C ABI.
+/* phobic 0.4.1 C ABI.
  *
  * One PHF type. Always-shard-aware (single-shard is the small-N degenerate;
  * its overhead is constant: one extra uint64 add per query). Always strict

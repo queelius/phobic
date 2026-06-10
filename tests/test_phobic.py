@@ -554,6 +554,16 @@ def test_lookup_fixed_validates_shape_and_threads():
         phf.lookup_fixed(arr, num_threads=0)
 
 
+def test_lookup_fixed_rejects_non_uint8_dtype():
+    """A non-uint8 array must be rejected, not silently cast mod 256 (which
+    would truncate key values and produce wrong/colliding slots)."""
+    np = pytest.importorskip("numpy")
+    phf = phobic.build([b"aa", b"bb", b"cc"], seed=0)
+    bad = np.array([[256, 1], [2, 3], [4, 5]], dtype=np.int64)  # 256 would wrap to 0
+    with pytest.raises(TypeError, match="uint8"):
+        phf.lookup_fixed(bad)
+
+
 def test_build_and_lookup_accept_bytes_subclass():
     """A bytes subclass works as a key through both build() and lookup():
     the shared key-encoding helper passes such instances straight to C."""

@@ -808,32 +808,91 @@ size_t phobic_query(const phobic_phf *phf, const char *key, size_t key_len) {
     return phf->shard_offsets[s] + local;
 }
 
-/* ── pthread batch query ─────────────────────────────────────────────── */
+/* ── parallel/serial fan-out over an index range (shared batch-query core) ─ */
+
+/* Per-key cost differs sharply between the two batch entry points, so each
+ * passes its own threading threshold (0.4.0 study, .claude/EXPERIMENTS_0_4_0.md).
+ * Per-call pthread_create x N + join overhead dwarfs cheap per-key work until
+ * the batch is large enough; below the threshold, serial is faster.
+ *  - list path (phobic_query_batch): per-key PyObject marshalling is serial
+ *    (outside the GIL-released window), so parallelism is Amdahl-capped at
+ *    ~1.25x and only pays past ~256K keys.
+ *  - fixed path (phobic_query_fixed_batch): pure C over contiguous buffers, no
+ *    per-key Python objects, so parallelism gives ~4-5x and pays from ~32K. */
+#define PHOBIC_BATCH_THREADING_THRESHOLD       ((size_t)262144)  /* list path */
+#define PHOBIC_FIXED_BATCH_THREADING_THRESHOLD ((size_t)32768)   /* numpy path */
+
+/* body(ctx, start, end) processes the half-open index range [start, end).
+ * Chunks are disjoint and cover [0, n), so output slots never alias and no
+ * synchronisation is needed; output is independent of how the range is split
+ * (hence of num_threads). */
+typedef void (*range_body)(void *ctx, size_t start, size_t end);
 
 #if PHOBIC_HAVE_PTHREAD
-typedef struct {
-    const phobic_phf *phf;
-    const char **keys;
-    const size_t *key_lens;
-    size_t *out_slots;
-    size_t start, end;
-} batch_chunk;
-
-static void *batch_worker(void *arg) {
-    batch_chunk *c = (batch_chunk *)arg;
-    for (size_t i = c->start; i < c->end; i++)
-        c->out_slots[i] = phobic_query(c->phf, c->keys[i], c->key_lens[i]);
+typedef struct { range_body body; void *ctx; size_t start, end; } range_chunk;
+static void *range_trampoline(void *arg) {
+    range_chunk *c = (range_chunk *)arg;
+    c->body(c->ctx, c->start, c->end);
     return NULL;
 }
 #endif
 
-/* Threading threshold. Empirically (0.4.0 study, .claude/EXPERIMENTS_0_4_0.md),
- * per-call pthread_create x N + join + GIL cycling costs hundreds of us, which
- * dwarfs the ~100 ns/key query work until the batch is very large. The old
- * 1024 threshold made moderate batches (1K-64K) 1.4x-63x SLOWER than serial.
- * Parallel only reliably wins past ~256K keys (and only marginally without a
- * persistent thread pool), so the threshold is set there. */
-#define PHOBIC_BATCH_THREADING_THRESHOLD ((size_t)262144)
+/* Run `body` over [0, n) in `num_threads` contiguous chunks on worker threads
+ * when n >= threshold (and pthread is available), else serially on the calling
+ * thread. num_threads <= 0 means "auto" (online CPU count), matching build. */
+static void run_chunked(size_t n, int num_threads, size_t threshold,
+                        range_body body, void *ctx) {
+    if (num_threads <= 0) {
+        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = cpu > 1 ? (int)cpu : 1;
+    }
+#if PHOBIC_HAVE_PTHREAD
+    if (num_threads > 1 && n >= threshold) {
+        if ((size_t)num_threads > n) num_threads = (int)n;  /* no idle workers */
+        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
+        range_chunk *chunks = malloc((size_t)num_threads * sizeof(range_chunk));
+        if (threads && chunks) {
+            size_t per = n / (size_t)num_threads;
+            size_t rem = n % (size_t)num_threads;
+            size_t cursor = 0;
+            int spawned = 0;
+            for (int t = 0; t < num_threads; t++) {
+                size_t this_chunk = per + ((size_t)t < rem ? 1 : 0);
+                chunks[t] = (range_chunk){ body, ctx, cursor, cursor + this_chunk };
+                cursor += this_chunk;
+                if (pthread_create(&threads[t], NULL, range_trampoline, &chunks[t]) == 0) {
+                    spawned++;
+                } else {
+                    /* Spawn failed: run all remaining work [chunks[t].start, n)
+                     * on the calling thread in one pass (the unspawned tail). */
+                    body(ctx, chunks[t].start, n);
+                    break;
+                }
+            }
+            for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+            free(threads); free(chunks);
+            return;
+        }
+        free(threads); free(chunks);  /* alloc failure -> serial fallback */
+    }
+#endif
+    body(ctx, 0, n);
+}
+
+/* ── batch query: list of (key, key_len) ─────────────────────────────── */
+
+typedef struct {
+    const phobic_phf *phf;
+    const char **keys;
+    const size_t *key_lens;
+    size_t *out;
+} batch_ctx;
+
+static void batch_body(void *p, size_t start, size_t end) {
+    const batch_ctx *c = (const batch_ctx *)p;
+    for (size_t i = start; i < end; i++)
+        c->out[i] = phobic_query(c->phf, c->keys[i], c->key_lens[i]);
+}
 
 void phobic_query_batch(const phobic_phf *phf,
                          const char **keys,
@@ -841,134 +900,31 @@ void phobic_query_batch(const phobic_phf *phf,
                          size_t n,
                          size_t *out_slots,
                          int num_threads) {
-    /* num_threads <= 0 means "auto": resolve to the online CPU count, the
-     * same convention phobic_build_with_diag uses. This makes PHF.lookup()
-     * parallelise by default instead of silently staying single-threaded. */
-    if (num_threads <= 0) {
-        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = cpu > 1 ? (int)cpu : 1;
-    }
-#if PHOBIC_HAVE_PTHREAD
-    if (num_threads > 1 && n >= PHOBIC_BATCH_THREADING_THRESHOLD) {
-        /* Cap threads to n so we never have idle workers. */
-        if ((size_t)num_threads > n) num_threads = (int)n;
-
-        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
-        batch_chunk *chunks = malloc((size_t)num_threads * sizeof(batch_chunk));
-        if (!threads || !chunks) {
-            /* Fall back to serial on alloc failure. */
-            free(threads); free(chunks);
-            goto serial;
-        }
-
-        size_t per = n / (size_t)num_threads;
-        size_t rem = n % (size_t)num_threads;
-        size_t cursor = 0;
-        int spawned = 0;
-        for (int t = 0; t < num_threads; t++) {
-            size_t this_chunk = per + ((size_t)t < rem ? 1 : 0);
-            chunks[t].phf       = phf;
-            chunks[t].keys      = keys;
-            chunks[t].key_lens  = key_lens;
-            chunks[t].out_slots = out_slots;
-            chunks[t].start     = cursor;
-            chunks[t].end       = cursor + this_chunk;
-            cursor += this_chunk;
-            if (pthread_create(&threads[t], NULL, batch_worker, &chunks[t]) == 0) {
-                spawned++;
-            } else {
-                /* Spawn failed; run this chunk and all remaining chunks on the
-                 * calling thread. chunks[t] is already initialized, but
-                 * chunks[t+1..] are not (they get filled at the top of their
-                 * own iteration), so fill each before running it. `cursor`
-                 * currently points at the start of chunk t+1. */
-                batch_worker(&chunks[t]);
-                for (int u = t + 1; u < num_threads; u++) {
-                    size_t uc = per + ((size_t)u < rem ? 1 : 0);
-                    chunks[u].phf       = phf;
-                    chunks[u].keys      = keys;
-                    chunks[u].key_lens  = key_lens;
-                    chunks[u].out_slots = out_slots;
-                    chunks[u].start     = cursor;
-                    chunks[u].end       = cursor + uc;
-                    cursor += uc;
-                    batch_worker(&chunks[u]);
-                }
-                break;
-            }
-        }
-        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-        free(threads); free(chunks);
-        return;
-    }
-serial:
-#endif
-    for (size_t i = 0; i < n; i++)
-        out_slots[i] = phobic_query(phf, keys[i], key_lens[i]);
+    batch_ctx ctx = { phf, keys, key_lens, out_slots };
+    run_chunked(n, num_threads, PHOBIC_BATCH_THREADING_THRESHOLD, batch_body, &ctx);
 }
 
 /* ── fixed-width batch query (numpy bulk path) ───────────────────────── */
 
-#if PHOBIC_HAVE_PTHREAD
 typedef struct {
     const phobic_phf *phf;
     const uint8_t *keys;
     size_t width;
     uint64_t *out;
-    size_t start, end;
-} fixed_chunk;
+} fixed_ctx;
 
-static void *fixed_worker(void *arg) {
-    fixed_chunk *c = (fixed_chunk *)arg;
-    for (size_t i = c->start; i < c->end; i++)
+static void fixed_body(void *p, size_t start, size_t end) {
+    const fixed_ctx *c = (const fixed_ctx *)p;
+    for (size_t i = start; i < end; i++)
         c->out[i] = phobic_query(c->phf,
                                  (const char *)(c->keys + i * c->width), c->width);
-    return NULL;
 }
-#endif
 
 void phobic_query_fixed_batch(const phobic_phf *phf, const uint8_t *keys,
                               size_t width, size_t n, uint64_t *out,
                               int num_threads) {
-    if (num_threads <= 0) {
-        long cpu = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = cpu > 1 ? (int)cpu : 1;
-    }
-#if PHOBIC_HAVE_PTHREAD
-    if (num_threads > 1 && n >= PHOBIC_BATCH_THREADING_THRESHOLD) {
-        if ((size_t)num_threads > n) num_threads = (int)n;
-        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
-        fixed_chunk *chunks = malloc((size_t)num_threads * sizeof(fixed_chunk));
-        if (!threads || !chunks) { free(threads); free(chunks); goto serial; }
-        size_t per = n / (size_t)num_threads;
-        size_t rem = n % (size_t)num_threads;
-        size_t cursor = 0;
-        int spawned = 0;
-        for (int t = 0; t < num_threads; t++) {
-            size_t this_chunk = per + ((size_t)t < rem ? 1 : 0);
-            chunks[t] = (fixed_chunk){phf, keys, width, out, cursor, cursor + this_chunk};
-            cursor += this_chunk;
-            if (pthread_create(&threads[t], NULL, fixed_worker, &chunks[t]) == 0) {
-                spawned++;
-            } else {
-                fixed_worker(&chunks[t]);
-                for (int u = t + 1; u < num_threads; u++) {
-                    size_t uc = per + ((size_t)u < rem ? 1 : 0);
-                    chunks[u] = (fixed_chunk){phf, keys, width, out, cursor, cursor + uc};
-                    cursor += uc;
-                    fixed_worker(&chunks[u]);
-                }
-                break;
-            }
-        }
-        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-        free(threads); free(chunks);
-        return;
-    }
-serial:
-#endif
-    for (size_t i = 0; i < n; i++)
-        out[i] = phobic_query(phf, (const char *)(keys + i * width), width);
+    fixed_ctx ctx = { phf, keys, width, out };
+    run_chunked(n, num_threads, PHOBIC_FIXED_BATCH_THREADING_THRESHOLD, fixed_body, &ctx);
 }
 
 /* ── serialization (wire format v4) ───────────────────────────────────── */

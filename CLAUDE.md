@@ -76,7 +76,9 @@ See `.claude/SWEEP_BUCKET_SIZE.md` (0.2.0 era) and `.claude/SWEEP_0_3_0.md` (cur
 
 **Threading model**: `phobic_build_with_diag` allocates per-shard buffers, distributes keys, then dispatches per-shard build either to a pthread work queue (when `num_threads > 1` and `PHOBIC_HAVE_PTHREAD`) or to a serial loop. After join, results are checked for the first failure; a diagnostic is filled into the optional `phobic_build_diag` struct.
 
-`phobic_query_batch` chunks the input range across `num_threads` workers when `n >= PHOBIC_BATCH_THREADING_THRESHOLD` (262144 since 0.4.0; was 1024, which made moderate-batch `lookup()` 1.4x-63x slower than serial because per-call `pthread_create` x N dwarfs the ~100 ns/key work). Below the threshold, serial. Output slots are disjoint between workers, so no synchronisation is needed. `phobic_query_fixed_batch` is the same fan-out over a fixed-width contiguous key buffer writing `uint64` slots (the numpy `lookup_fixed` path).
+Both batch-query paths go through one shared fan-out, `run_chunked(n, num_threads, threshold, body, ctx)`: it splits `[0, n)` into `num_threads` contiguous chunks over worker threads when `n >= threshold` (and pthread is available), else runs `body` serially. Output slots are disjoint per chunk (no synchronisation), and the split never affects output, so query results are independent of `num_threads`. The spawn-failure fallback runs the entire unspawned tail `[chunks[t].start, n)` on the calling thread in one pass. `phobic_query_batch` (list path) and `phobic_query_fixed_batch` (numpy `lookup_fixed` path) are thin wrappers over it that differ only in the per-key body.
+
+The two paths pass **different thresholds**, because their per-key cost differs (measured, `.claude/EXPERIMENTS_0_4_0.md`): `PHOBIC_BATCH_THREADING_THRESHOLD` = 262144 for the list path (per-key PyObject marshalling is serial and Amdahl-caps parallelism at ~1.25x, so only worth it past ~256K; was 1024 in 0.3.2, which made moderate batches 1.4x-63x slower than serial), and `PHOBIC_FIXED_BATCH_THREADING_THRESHOLD` = 32768 for the fixed/numpy path (pure C over contiguous buffers, no per-key Python objects, so it gets ~4-5x and pays from ~32K; crossover measured at ~24K). Do not collapse these to one value: the fixed path needs the lower threshold to capture the 2-4x win on 32K-256K batches, and the list path needs the higher one to avoid the spawn-overhead regression.
 
 The pthread code is gated by `PHOBIC_HAVE_PTHREAD` (defined as `1` on non-Windows and `0` on Windows in `_phobic.c`). On Windows the build falls back to single-threaded and `phobic_query_batch` is serial. A pthread-w32 (or `<threads.h>`) port would lift that.
 
@@ -144,7 +146,22 @@ Optional profiling build: `CFLAGS="-DPHOBIC_PROFILE=1" pip install -e .` enables
 
 ## Version snapshot
 
-Current version: 0.4.0 (`pyproject.toml`).
+Current version: 0.4.1 (`pyproject.toml`).
+
+0.4.1 is a review-driven patch on 0.4.0 (no wire-format change; PHF4 unchanged):
+- **Fixed: `lookup_fixed` silently cast non-uint8 input** mod 256 (truncating key
+  values -> wrong/colliding slots). It now raises `TypeError` on non-uint8; the
+  returned array is documented as read-only.
+- **Faster numpy bulk query (own threshold).** `phobic_query_fixed_batch` now uses
+  `PHOBIC_FIXED_BATCH_THREADING_THRESHOLD` = 32768 instead of sharing the list
+  path's 262144. The fixed path is pure C (no per-key PyObject marshalling), so its
+  parallel crossover is ~24K, not ~256K; measured 2-4x faster on 32K-256K numpy
+  batches that were needlessly serial in 0.4.0. List path threshold unchanged.
+- **Refactor: one shared `run_chunked` fan-out** behind both batch-query paths
+  (parameterised by the per-path threshold), removing the duplicated pthread
+  spawn-failure fallback. Behaviour-preserving; query results and determinism
+  unchanged. Independently reviewed (ASan/UBSan fuzz over the PHF4 deserialiser
+  found no memory-safety issues).
 
 0.4.0 is the efficiency release from the study in `.claude/EXPERIMENTS_0_4_0.md`
 (plan in `.claude/DESIGN_EXPERIMENTS_0_4_0.md`). Three shipped wins:
