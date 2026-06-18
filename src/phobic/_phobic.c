@@ -846,6 +846,7 @@ static void run_chunked(size_t n, int num_threads, size_t threshold,
         long cpu = sysconf(_SC_NPROCESSORS_ONLN);
         num_threads = cpu > 1 ? (int)cpu : 1;
     }
+    (void)threshold;  /* only read under PHOBIC_HAVE_PTHREAD (serial build ignores it) */
 #if PHOBIC_HAVE_PTHREAD
     if (num_threads > 1 && n >= threshold) {
         if ((size_t)num_threads > n) num_threads = (int)n;  /* no idle workers */
